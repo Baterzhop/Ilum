@@ -10,11 +10,11 @@ public enum KnowledgeStoreError: Error, CustomStringConvertible, Sendable, Equat
 
     public var description: String {
         switch self {
-        case .openFailed(let m): return "Knowledge SQLite open failed: \(m)"
-        case .statementFailed(let m): return "Knowledge SQLite statement failed: \(m)"
-        case .executionFailed(let m): return "Knowledge SQLite execution failed: \(m)"
-        case .invalidRecord(let m): return "Knowledge record is invalid: \(m)"
-        case .corruptData(let m): return "Knowledge SQLite data is invalid: \(m)"
+        case .openFailed(let message): return "Knowledge SQLite open failed: \(message)"
+        case .statementFailed(let message): return "Knowledge SQLite statement failed: \(message)"
+        case .executionFailed(let message): return "Knowledge SQLite execution failed: \(message)"
+        case .invalidRecord(let message): return "Knowledge record is invalid: \(message)"
+        case .corruptData(let message): return "Knowledge SQLite data is invalid: \(message)"
         }
     }
 }
@@ -25,37 +25,73 @@ private final class KnowledgeSQLiteConnection: @unchecked Sendable {
     deinit { sqlite3_close_v2(raw) }
 }
 
-public actor SQLiteKnowledgeStore: KnowledgeStore {
+/// Durable Knowledge storage plus an optional persistent SQLite FTS5 sparse index.
+/// The normalized document/chunk tables are authoritative. FTS5 is an acceleration
+/// layer; if the platform SQLite lacks FTS5, callers can still use the deterministic
+/// Swift lexical retriever over the same durable records.
+public actor SQLiteKnowledgeStore: MutableKnowledgeStore, KnowledgeRetriever {
     private let connection: KnowledgeSQLiteConnection
+    private let ftsAvailable: Bool
 
     public init(url: URL) throws {
-        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+
         var handle: OpaquePointer?
         let flags = SQLITE_OPEN_CREATE | SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX
         let status = sqlite3_open_v2(url.path, &handle, flags, nil)
         guard status == SQLITE_OK, let handle else {
-            let message = handle.flatMap { sqlite3_errmsg($0) }.map { String(cString: $0) } ?? "unknown error"
+            let message = handle.flatMap { sqlite3_errmsg($0) }
+                .map { String(cString: $0) } ?? "unknown error"
             if let handle { sqlite3_close_v2(handle) }
             throw KnowledgeStoreError.openFailed(message)
         }
+
         do {
             try Self.execute(handle, sql: "PRAGMA foreign_keys = ON;")
             try Self.execute(handle, sql: "PRAGMA journal_mode = WAL;")
             try Self.execute(handle, sql: "PRAGMA synchronous = NORMAL;")
             try Self.execute(handle, sql: Self.schema)
-            connection = KnowledgeSQLiteConnection(raw: handle)
         } catch {
             sqlite3_close_v2(handle)
             throw error
         }
+
+        var enabledFTS = false
+        do {
+            try Self.execute(handle, sql: Self.ftsSchema)
+            try Self.synchronizeFTS(handle)
+            enabledFTS = true
+        } catch {
+            // FTS5 is an optimization, not a durability prerequisite.
+            enabledFTS = false
+        }
+
+        connection = KnowledgeSQLiteConnection(raw: handle)
+        ftsAvailable = enabledFTS
     }
 
-    public func loadDocument(sourceResourceID: UserFileResourceID) async throws -> KnowledgeDocument? {
+    public func loadDocument(
+        sourceResourceID: UserFileResourceID
+    ) async throws -> KnowledgeDocument? {
         let db = connection.raw
         var statement: OpaquePointer?
-        try prepare(db, sql: "SELECT id, source_resource_id, display_name, media_type, page_count, metadata_json, created_at, updated_at FROM knowledge_documents WHERE source_resource_id = ?1 LIMIT 1;", statement: &statement)
+        try prepare(
+            db,
+            sql: """
+            SELECT id, source_resource_id, display_name, media_type, page_count,
+                   metadata_json, created_at, updated_at
+            FROM knowledge_documents
+            WHERE source_resource_id = ?1
+            LIMIT 1;
+            """,
+            statement: &statement
+        )
         defer { sqlite3_finalize(statement) }
         bind(sourceResourceID.rawValue, to: statement, index: 1)
+
         switch sqlite3_step(statement) {
         case SQLITE_ROW: return try decodeDocument(statement)
         case SQLITE_DONE: return nil
@@ -66,26 +102,43 @@ public actor SQLiteKnowledgeStore: KnowledgeStore {
     public func loadChunks(documentID: UUID) async throws -> [KnowledgeChunk] {
         let db = connection.raw
         var statement: OpaquePointer?
-        try prepare(db, sql: "SELECT id, document_id, ordinal, page_start, page_end, text FROM knowledge_chunks WHERE document_id = ?1 ORDER BY ordinal ASC;", statement: &statement)
+        try prepare(
+            db,
+            sql: """
+            SELECT id, document_id, ordinal, page_start, page_end, text
+            FROM knowledge_chunks
+            WHERE document_id = ?1
+            ORDER BY ordinal ASC;
+            """,
+            statement: &statement
+        )
         defer { sqlite3_finalize(statement) }
         bind(documentID.uuidString, to: statement, index: 1)
+
         var chunks: [KnowledgeChunk] = []
         while true {
             switch sqlite3_step(statement) {
             case SQLITE_ROW:
-                guard let id = UUID(uuidString: text(statement, column: 0)),
-                      let storedDocumentID = UUID(uuidString: text(statement, column: 1)) else {
+                guard
+                    let id = UUID(uuidString: text(statement, column: 0)),
+                    let storedDocumentID = UUID(uuidString: text(statement, column: 1))
+                else {
                     throw KnowledgeStoreError.corruptData("invalid chunk UUID")
                 }
-                chunks.append(KnowledgeChunk(
-                    id: id, documentID: storedDocumentID,
-                    ordinal: Int(sqlite3_column_int64(statement, 2)),
-                    pageStart: Int(sqlite3_column_int64(statement, 3)),
-                    pageEnd: Int(sqlite3_column_int64(statement, 4)),
-                    text: text(statement, column: 5)
-                ))
-            case SQLITE_DONE: return chunks
-            default: throw KnowledgeStoreError.executionFailed(errorMessage(db))
+                chunks.append(
+                    KnowledgeChunk(
+                        id: id,
+                        documentID: storedDocumentID,
+                        ordinal: Int(sqlite3_column_int64(statement, 2)),
+                        pageStart: Int(sqlite3_column_int64(statement, 3)),
+                        pageEnd: Int(sqlite3_column_int64(statement, 4)),
+                        text: text(statement, column: 5)
+                    )
+                )
+            case SQLITE_DONE:
+                return chunks
+            default:
+                throw KnowledgeStoreError.executionFailed(errorMessage(db))
             }
         }
     }
@@ -93,33 +146,74 @@ public actor SQLiteKnowledgeStore: KnowledgeStore {
     public func listDocuments() async throws -> [KnowledgeDocument] {
         let db = connection.raw
         var statement: OpaquePointer?
-        try prepare(db, sql: "SELECT id, source_resource_id, display_name, media_type, page_count, metadata_json, created_at, updated_at FROM knowledge_documents ORDER BY updated_at DESC, display_name ASC;", statement: &statement)
+        try prepare(
+            db,
+            sql: """
+            SELECT id, source_resource_id, display_name, media_type, page_count,
+                   metadata_json, created_at, updated_at
+            FROM knowledge_documents
+            ORDER BY updated_at DESC, display_name ASC;
+            """,
+            statement: &statement
+        )
         defer { sqlite3_finalize(statement) }
+
         var documents: [KnowledgeDocument] = []
         while true {
             switch sqlite3_step(statement) {
-            case SQLITE_ROW: documents.append(try decodeDocument(statement))
-            case SQLITE_DONE: return documents
-            default: throw KnowledgeStoreError.executionFailed(errorMessage(db))
+            case SQLITE_ROW:
+                documents.append(try decodeDocument(statement))
+            case SQLITE_DONE:
+                return documents
+            default:
+                throw KnowledgeStoreError.executionFailed(errorMessage(db))
             }
         }
     }
 
-    public func replaceDocument(_ document: KnowledgeDocument, chunks: [KnowledgeChunk]) async throws {
+    public func replaceDocument(
+        _ document: KnowledgeDocument,
+        chunks: [KnowledgeChunk]
+    ) async throws {
         try validate(document: document, chunks: chunks)
         let metadataJSON = try encodeMetadata(document.metadata)
         let db = connection.raw
+
         try Self.execute(db, sql: "BEGIN IMMEDIATE TRANSACTION;")
         do {
             var cleanup: OpaquePointer?
-            try prepare(db, sql: "DELETE FROM knowledge_documents WHERE source_resource_id = ?1 AND id <> ?2;", statement: &cleanup)
+            try prepare(
+                db,
+                sql: "DELETE FROM knowledge_documents WHERE source_resource_id = ?1 AND id <> ?2;",
+                statement: &cleanup
+            )
             bind(document.sourceResourceID.rawValue, to: cleanup, index: 1)
             bind(document.id.uuidString, to: cleanup, index: 2)
             try stepDone(cleanup, db: db)
             sqlite3_finalize(cleanup)
 
+            if ftsAvailable {
+                try Self.cleanupStaleFTS(db)
+            }
+
             var documentStatement: OpaquePointer?
-            try prepare(db, sql: "INSERT INTO knowledge_documents (id, source_resource_id, display_name, media_type, page_count, metadata_json, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) ON CONFLICT(id) DO UPDATE SET source_resource_id=excluded.source_resource_id, display_name=excluded.display_name, media_type=excluded.media_type, page_count=excluded.page_count, metadata_json=excluded.metadata_json, updated_at=excluded.updated_at;", statement: &documentStatement)
+            try prepare(
+                db,
+                sql: """
+                INSERT INTO knowledge_documents (
+                    id, source_resource_id, display_name, media_type, page_count,
+                    metadata_json, created_at, updated_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                ON CONFLICT(id) DO UPDATE SET
+                    source_resource_id = excluded.source_resource_id,
+                    display_name = excluded.display_name,
+                    media_type = excluded.media_type,
+                    page_count = excluded.page_count,
+                    metadata_json = excluded.metadata_json,
+                    updated_at = excluded.updated_at;
+                """,
+                statement: &documentStatement
+            )
             bind(document.id.uuidString, to: documentStatement, index: 1)
             bind(document.sourceResourceID.rawValue, to: documentStatement, index: 2)
             bind(document.displayName, to: documentStatement, index: 3)
@@ -131,13 +225,26 @@ public actor SQLiteKnowledgeStore: KnowledgeStore {
             try stepDone(documentStatement, db: db)
             sqlite3_finalize(documentStatement)
 
+            if ftsAvailable {
+                try deleteFTS(documentID: document.id, db: db)
+            }
+
             var deleteChunks: OpaquePointer?
-            try prepare(db, sql: "DELETE FROM knowledge_chunks WHERE document_id = ?1;", statement: &deleteChunks)
+            try prepare(
+                db,
+                sql: "DELETE FROM knowledge_chunks WHERE document_id = ?1;",
+                statement: &deleteChunks
+            )
             bind(document.id.uuidString, to: deleteChunks, index: 1)
             try stepDone(deleteChunks, db: db)
             sqlite3_finalize(deleteChunks)
 
-            let insertSQL = "INSERT INTO knowledge_chunks (id, document_id, ordinal, page_start, page_end, text) VALUES (?1, ?2, ?3, ?4, ?5, ?6);"
+            let insertSQL = """
+            INSERT INTO knowledge_chunks (
+                id, document_id, ordinal, page_start, page_end, text
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6);
+            """
+
             for chunk in chunks {
                 var statement: OpaquePointer?
                 try prepare(db, sql: insertSQL, statement: &statement)
@@ -149,7 +256,12 @@ public actor SQLiteKnowledgeStore: KnowledgeStore {
                 bind(chunk.text, to: statement, index: 6)
                 try stepDone(statement, db: db)
                 sqlite3_finalize(statement)
+
+                if ftsAvailable {
+                    try insertFTS(chunk: chunk, db: db)
+                }
             }
+
             try Self.execute(db, sql: "COMMIT;")
         } catch {
             try? Self.execute(db, sql: "ROLLBACK;")
@@ -157,26 +269,237 @@ public actor SQLiteKnowledgeStore: KnowledgeStore {
         }
     }
 
-    private func validate(document: KnowledgeDocument, chunks: [KnowledgeChunk]) throws {
-        guard document.pageCount > 0 else { throw KnowledgeStoreError.invalidRecord("pageCount must be positive") }
-        guard !document.displayName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw KnowledgeStoreError.invalidRecord("displayName cannot be empty") }
-        guard !document.mediaType.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw KnowledgeStoreError.invalidRecord("mediaType cannot be empty") }
-        guard !chunks.isEmpty else { throw KnowledgeStoreError.invalidRecord("at least one chunk is required") }
+    public func removeDocument(
+        sourceResourceID: UserFileResourceID
+    ) async throws {
+        let db = connection.raw
+        let documentID = try findDocumentID(
+            sourceResourceID: sourceResourceID,
+            db: db
+        )
+        guard let documentID else { return }
+
+        try Self.execute(db, sql: "BEGIN IMMEDIATE TRANSACTION;")
+        do {
+            if ftsAvailable {
+                try deleteFTS(documentID: documentID, db: db)
+            }
+
+            var statement: OpaquePointer?
+            try prepare(
+                db,
+                sql: "DELETE FROM knowledge_documents WHERE id = ?1;",
+                statement: &statement
+            )
+            bind(documentID.uuidString, to: statement, index: 1)
+            try stepDone(statement, db: db)
+            sqlite3_finalize(statement)
+
+            try Self.execute(db, sql: "COMMIT;")
+        } catch {
+            try? Self.execute(db, sql: "ROLLBACK;")
+            throw error
+        }
+    }
+
+    /// Persistent FTS5 sparse retrieval. If FTS5 is unavailable or a query fails,
+    /// the deterministic Swift BM25 implementation remains the correctness fallback.
+    public func search(
+        _ query: String,
+        maxHits: Int
+    ) async throws -> [KnowledgeHit] {
+        guard (1...50).contains(maxHits) else {
+            throw KnowledgeRetrievalError.invalidMaxHits
+        }
+
+        let terms = Array(Set(LexicalKnowledgeRetriever.tokenize(query))).sorted()
+        guard !terms.isEmpty else { return [] }
+        guard ftsAvailable else {
+            return try await LexicalKnowledgeRetriever(store: self)
+                .search(query, maxHits: maxHits)
+        }
+
+        do {
+            return try searchFTS(terms: terms, maxHits: maxHits)
+        } catch {
+            return try await LexicalKnowledgeRetriever(store: self)
+                .search(query, maxHits: maxHits)
+        }
+    }
+
+    public func isFTSAvailable() -> Bool { ftsAvailable }
+
+    private func searchFTS(
+        terms: [String],
+        maxHits: Int
+    ) throws -> [KnowledgeHit] {
+        let db = connection.raw
+        let matchExpression = terms.map { "\"\($0)\"" }.joined(separator: " OR ")
+        var statement: OpaquePointer?
+        try prepare(
+            db,
+            sql: """
+            SELECT
+                kc.id,
+                kc.document_id,
+                kc.ordinal,
+                kc.page_start,
+                kc.page_end,
+                kc.text,
+                kd.source_resource_id,
+                kd.display_name,
+                bm25(knowledge_chunks_fts)
+            FROM knowledge_chunks_fts
+            JOIN knowledge_chunks kc ON kc.id = knowledge_chunks_fts.chunk_id
+            JOIN knowledge_documents kd ON kd.id = kc.document_id
+            WHERE knowledge_chunks_fts MATCH ?1
+            ORDER BY bm25(knowledge_chunks_fts) ASC, kd.id ASC, kc.ordinal ASC, kc.id ASC
+            LIMIT ?2;
+            """,
+            statement: &statement
+        )
+        defer { sqlite3_finalize(statement) }
+        bind(matchExpression, to: statement, index: 1)
+        sqlite3_bind_int64(statement, 2, sqlite3_int64(maxHits))
+
+        var hits: [KnowledgeHit] = []
+        while true {
+            switch sqlite3_step(statement) {
+            case SQLITE_ROW:
+                guard
+                    let chunkID = UUID(uuidString: text(statement, column: 0)),
+                    let documentID = UUID(uuidString: text(statement, column: 1))
+                else {
+                    throw KnowledgeStoreError.corruptData("invalid FTS document/chunk identity")
+                }
+                hits.append(
+                    KnowledgeHit(
+                        documentID: documentID,
+                        sourceResourceID: UserFileResourceID(rawValue: text(statement, column: 6)),
+                        displayName: text(statement, column: 7),
+                        chunkID: chunkID,
+                        chunkOrdinal: Int(sqlite3_column_int64(statement, 2)),
+                        pageStart: Int(sqlite3_column_int64(statement, 3)),
+                        pageEnd: Int(sqlite3_column_int64(statement, 4)),
+                        score: -sqlite3_column_double(statement, 8),
+                        text: text(statement, column: 5)
+                    )
+                )
+            case SQLITE_DONE:
+                return hits
+            default:
+                throw KnowledgeStoreError.executionFailed(errorMessage(db))
+            }
+        }
+    }
+
+    private func findDocumentID(
+        sourceResourceID: UserFileResourceID,
+        db: OpaquePointer
+    ) throws -> UUID? {
+        var statement: OpaquePointer?
+        try prepare(
+            db,
+            sql: "SELECT id FROM knowledge_documents WHERE source_resource_id = ?1 LIMIT 1;",
+            statement: &statement
+        )
+        defer { sqlite3_finalize(statement) }
+        bind(sourceResourceID.rawValue, to: statement, index: 1)
+        switch sqlite3_step(statement) {
+        case SQLITE_ROW:
+            guard let id = UUID(uuidString: text(statement, column: 0)) else {
+                throw KnowledgeStoreError.corruptData("invalid document UUID")
+            }
+            return id
+        case SQLITE_DONE:
+            return nil
+        default:
+            throw KnowledgeStoreError.executionFailed(errorMessage(db))
+        }
+    }
+
+    private func insertFTS(
+        chunk: KnowledgeChunk,
+        db: OpaquePointer
+    ) throws {
+        var statement: OpaquePointer?
+        try prepare(
+            db,
+            sql: "INSERT INTO knowledge_chunks_fts (chunk_id, document_id, text) VALUES (?1, ?2, ?3);",
+            statement: &statement
+        )
+        defer { sqlite3_finalize(statement) }
+        bind(chunk.id.uuidString, to: statement, index: 1)
+        bind(chunk.documentID.uuidString, to: statement, index: 2)
+        bind(chunk.text, to: statement, index: 3)
+        try stepDone(statement, db: db)
+    }
+
+    private func deleteFTS(
+        documentID: UUID,
+        db: OpaquePointer
+    ) throws {
+        var statement: OpaquePointer?
+        try prepare(
+            db,
+            sql: "DELETE FROM knowledge_chunks_fts WHERE document_id = ?1;",
+            statement: &statement
+        )
+        defer { sqlite3_finalize(statement) }
+        bind(documentID.uuidString, to: statement, index: 1)
+        try stepDone(statement, db: db)
+    }
+
+    private func validate(
+        document: KnowledgeDocument,
+        chunks: [KnowledgeChunk]
+    ) throws {
+        guard document.pageCount > 0 else {
+            throw KnowledgeStoreError.invalidRecord("pageCount must be positive")
+        }
+        guard !document.displayName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw KnowledgeStoreError.invalidRecord("displayName cannot be empty")
+        }
+        guard !document.mediaType.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw KnowledgeStoreError.invalidRecord("mediaType cannot be empty")
+        }
+        guard !chunks.isEmpty else {
+            throw KnowledgeStoreError.invalidRecord("at least one chunk is required")
+        }
         for (expectedOrdinal, chunk) in chunks.enumerated() {
-            guard chunk.documentID == document.id else { throw KnowledgeStoreError.invalidRecord("chunk document identity mismatch") }
-            guard chunk.ordinal == expectedOrdinal else { throw KnowledgeStoreError.invalidRecord("chunk ordinals must be contiguous from zero") }
-            guard chunk.pageStart > 0, chunk.pageEnd >= chunk.pageStart, chunk.pageEnd <= document.pageCount else { throw KnowledgeStoreError.invalidRecord("chunk page provenance is outside the document") }
-            guard !chunk.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw KnowledgeStoreError.invalidRecord("chunk text cannot be empty") }
+            guard chunk.documentID == document.id else {
+                throw KnowledgeStoreError.invalidRecord("chunk document identity mismatch")
+            }
+            guard chunk.ordinal == expectedOrdinal else {
+                throw KnowledgeStoreError.invalidRecord("chunk ordinals must be contiguous from zero")
+            }
+            guard
+                chunk.pageStart > 0,
+                chunk.pageEnd >= chunk.pageStart,
+                chunk.pageEnd <= document.pageCount
+            else {
+                throw KnowledgeStoreError.invalidRecord("chunk page provenance is outside the document")
+            }
+            guard !chunk.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw KnowledgeStoreError.invalidRecord("chunk text cannot be empty")
+            }
         }
     }
 
     private func decodeDocument(_ statement: OpaquePointer?) throws -> KnowledgeDocument {
-        guard let id = UUID(uuidString: text(statement, column: 0)) else { throw KnowledgeStoreError.corruptData("invalid document UUID") }
+        guard let id = UUID(uuidString: text(statement, column: 0)) else {
+            throw KnowledgeStoreError.corruptData("invalid document UUID")
+        }
         let metadataText = text(statement, column: 5)
-        guard let metadataData = metadataText.data(using: .utf8) else { throw KnowledgeStoreError.corruptData("metadata is not UTF-8") }
+        guard let metadataData = metadataText.data(using: .utf8) else {
+            throw KnowledgeStoreError.corruptData("metadata is not UTF-8")
+        }
         let metadata: [String: JSONValue]
-        do { metadata = try JSONDecoder().decode([String: JSONValue].self, from: metadataData) }
-        catch { throw KnowledgeStoreError.corruptData("invalid metadata JSON") }
+        do {
+            metadata = try JSONDecoder().decode([String: JSONValue].self, from: metadataData)
+        } catch {
+            throw KnowledgeStoreError.corruptData("invalid metadata JSON")
+        }
         return KnowledgeDocument(
             id: id,
             sourceResourceID: UserFileResourceID(rawValue: text(statement, column: 1)),
@@ -190,37 +513,86 @@ public actor SQLiteKnowledgeStore: KnowledgeStore {
     }
 
     private func encodeMetadata(_ metadata: [String: JSONValue]) throws -> String {
-        let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
         let data = try encoder.encode(metadata)
-        guard let string = String(data: data, encoding: .utf8) else { throw KnowledgeStoreError.invalidRecord("metadata could not be encoded as UTF-8") }
+        guard let string = String(data: data, encoding: .utf8) else {
+            throw KnowledgeStoreError.invalidRecord("metadata could not be encoded as UTF-8")
+        }
         return string
     }
 
-    private func prepare(_ db: OpaquePointer, sql: String, statement: inout OpaquePointer?) throws {
-        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { throw KnowledgeStoreError.statementFailed(errorMessage(db)) }
+    private func prepare(
+        _ db: OpaquePointer,
+        sql: String,
+        statement: inout OpaquePointer?
+    ) throws {
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw KnowledgeStoreError.statementFailed(errorMessage(db))
+        }
     }
+
     private func bind(_ value: String, to statement: OpaquePointer?, index: Int32) {
         let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
         sqlite3_bind_text(statement, index, value, -1, transient)
     }
+
     private func stepDone(_ statement: OpaquePointer?, db: OpaquePointer) throws {
-        guard sqlite3_step(statement) == SQLITE_DONE else { throw KnowledgeStoreError.executionFailed(errorMessage(db)) }
+        guard sqlite3_step(statement) == SQLITE_DONE else {
+            throw KnowledgeStoreError.executionFailed(errorMessage(db))
+        }
     }
+
     private func text(_ statement: OpaquePointer?, column: Int32) -> String {
         guard let pointer = sqlite3_column_text(statement, column) else { return "" }
         return String(cString: pointer)
     }
-    private func errorMessage(_ db: OpaquePointer) -> String { String(cString: sqlite3_errmsg(db)) }
+
+    private func errorMessage(_ db: OpaquePointer) -> String {
+        String(cString: sqlite3_errmsg(db))
+    }
+
     private static func execute(_ db: OpaquePointer, sql: String) throws {
         var errorPointer: UnsafeMutablePointer<CChar>?
         guard sqlite3_exec(db, sql, nil, nil, &errorPointer) == SQLITE_OK else {
-            let message = errorPointer.map { String(cString: $0) } ?? String(cString: sqlite3_errmsg(db))
+            let message = errorPointer.map { String(cString: $0) }
+                ?? String(cString: sqlite3_errmsg(db))
             if let errorPointer { sqlite3_free(errorPointer) }
             throw KnowledgeStoreError.executionFailed(message)
         }
     }
 
+    private static func synchronizeFTS(_ db: OpaquePointer) throws {
+        try execute(
+            db,
+            sql: "DELETE FROM knowledge_chunks_fts WHERE chunk_id NOT IN (SELECT id FROM knowledge_chunks);"
+        )
+        try execute(
+            db,
+            sql: """
+            INSERT INTO knowledge_chunks_fts (chunk_id, document_id, text)
+            SELECT kc.id, kc.document_id, kc.text
+            FROM knowledge_chunks kc
+            WHERE NOT EXISTS (
+                SELECT 1 FROM knowledge_chunks_fts f WHERE f.chunk_id = kc.id
+            );
+            """
+        )
+    }
+
+    private static func cleanupStaleFTS(_ db: OpaquePointer) throws {
+        try execute(
+            db,
+            sql: "DELETE FROM knowledge_chunks_fts WHERE chunk_id NOT IN (SELECT id FROM knowledge_chunks);"
+        )
+    }
+
     private static let schema = """
+    CREATE TABLE IF NOT EXISTS schema_migrations (
+        version INTEGER PRIMARY KEY,
+        applied_at REAL NOT NULL
+    );
+
     CREATE TABLE IF NOT EXISTS knowledge_documents (
         id TEXT PRIMARY KEY,
         source_resource_id TEXT NOT NULL UNIQUE,
@@ -231,6 +603,7 @@ public actor SQLiteKnowledgeStore: KnowledgeStore {
         created_at REAL NOT NULL,
         updated_at REAL NOT NULL
     );
+
     CREATE TABLE IF NOT EXISTS knowledge_chunks (
         id TEXT PRIMARY KEY,
         document_id TEXT NOT NULL,
@@ -241,6 +614,23 @@ public actor SQLiteKnowledgeStore: KnowledgeStore {
         FOREIGN KEY(document_id) REFERENCES knowledge_documents(id) ON DELETE CASCADE,
         UNIQUE(document_id, ordinal)
     );
-    CREATE INDEX IF NOT EXISTS idx_knowledge_chunks_document ON knowledge_chunks(document_id, ordinal);
+
+    CREATE INDEX IF NOT EXISTS idx_knowledge_chunks_document
+        ON knowledge_chunks(document_id, ordinal);
+
+    INSERT OR IGNORE INTO schema_migrations(version, applied_at)
+        VALUES (1, strftime('%s','now'));
+    """
+
+    private static let ftsSchema = """
+    CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_chunks_fts USING fts5(
+        chunk_id UNINDEXED,
+        document_id UNINDEXED,
+        text,
+        tokenize = 'unicode61 remove_diacritics 2'
+    );
+
+    INSERT OR IGNORE INTO schema_migrations(version, applied_at)
+        VALUES (2, strftime('%s','now'));
     """
 }
