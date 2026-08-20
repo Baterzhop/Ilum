@@ -61,5 +61,10 @@ PLIST
 
 plutil -lint "$CONTENTS/Info.plist" >/dev/null
 
-echo "Built $APP"
+# Development/CI builds are ad-hoc signed. Distribution notarization with an
+# Apple Developer identity is a separate release concern and is not faked here.
+codesign --force --deep --sign - --timestamp=none "$APP"
+codesign --verify --deep --strict "$APP"
+
+echo "Built and ad-hoc signed $APP"
 echo "Launch with: open \"$APP\""
