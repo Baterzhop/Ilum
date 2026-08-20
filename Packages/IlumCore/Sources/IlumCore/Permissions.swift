@@ -11,7 +11,7 @@ public enum ToolRisk: Int, Codable, Comparable, Sendable {
     public static func < (lhs: ToolRisk, rhs: ToolRisk) -> Bool { lhs.rawValue < rhs.rawValue }
 }
 
-public enum ToolCapability: String, Codable, Sendable {
+public enum ToolCapability: String, Codable, Sendable, Hashable {
     case readAppData
     case writeAppData
     case readUserFile
@@ -30,6 +30,7 @@ public struct ResourceScope: Hashable, Codable, Sendable {
     public init(kind: Kind, identifier: String) { self.kind = kind; self.identifier = identifier }
     public static func file(_ identifier: String) -> ResourceScope { .init(kind: .file, identifier: identifier) }
     public static func userFile(_ id: UserFileResourceID) -> ResourceScope { .init(kind: .userFile, identifier: id.rawValue) }
+    public static func appData(_ identifier: String) -> ResourceScope { .init(kind: .appData, identifier: identifier) }
 }
 
 public enum GrantDuration: String, Codable, Sendable { case once, session }
@@ -77,7 +78,11 @@ public struct PermissionGrant: Identifiable, Equatable, Sendable {
 
 public actor PermissionEngine {
     private var grants: [UUID: PermissionGrant] = [:]
-    public init() {}
+    private let automaticallyAllowedCapabilities: Set<ToolCapability>
+
+    public init(automaticallyAllowedCapabilities: Set<ToolCapability> = []) {
+        self.automaticallyAllowedCapabilities = automaticallyAllowedCapabilities
+    }
 
     @discardableResult
     public func grant(_ request: PermissionRequest, duration: GrantDuration) -> PermissionGrant {
@@ -94,6 +99,9 @@ public actor PermissionEngine {
     public func revokeAll() { grants.removeAll() }
 
     public func authorize(_ request: PermissionRequest) -> Bool {
+        if automaticallyAllowedCapabilities.contains(request.capability) {
+            return true
+        }
         guard let match = grants.values.first(where: {
             $0.capability == request.capability && $0.resource == request.resource
         }) else { return false }
