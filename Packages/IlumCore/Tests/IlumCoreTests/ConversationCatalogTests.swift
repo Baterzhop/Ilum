@@ -39,8 +39,10 @@ final class ConversationCatalogTests: XCTestCase {
 
         try await store.deleteConversation(id: conversation.id)
 
-        XCTAssertNil(try await store.loadConversation(id: conversation.id))
-        XCTAssertTrue(try await store.listConversations().isEmpty)
+        let loaded = try await store.loadConversation(id: conversation.id)
+        let summaries = try await store.listConversations()
+        XCTAssertNil(loaded)
+        XCTAssertTrue(summaries.isEmpty)
     }
 
     private func temporaryURL(_ name: String) -> URL {
