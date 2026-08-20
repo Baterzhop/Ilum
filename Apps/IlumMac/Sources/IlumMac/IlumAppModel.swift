@@ -32,6 +32,9 @@ final class IlumAppModel: ObservableObject {
     private var embeddingProvider: OllamaEmbeddingProvider?
     private var knowledgeEngine: HybridKnowledgeIngestionEngine?
     private var memoryStore: SQLitePersonalMemoryStore?
+    private let permissionEngine = PermissionEngine(
+        automaticallyAllowedCapabilities: [.readAppData]
+    )
     private var modelEndpoint = URL(string: "http://127.0.0.1:11434/v1/chat/completions")!
     private var modelName: String?
     private var conversationID: UUID
@@ -96,7 +99,9 @@ final class IlumAppModel: ObservableObject {
 
     func send() {
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty, !isSending, !isSafeMode, pendingApproval == nil, let runtime else { return }
+        guard !text.isEmpty, !isSending, !isSafeMode, pendingApproval == nil,
+              let runtime else { return }
+
         draft = ""
         isSending = true
         lastError = nil
@@ -110,7 +115,11 @@ final class IlumAppModel: ObservableObject {
             do {
                 apply(try await runtime.send(text, conversationID: activeID))
             } catch {
-                await handleRuntimeError(error, runtime: runtime, conversationID: activeID)
+                await handleRuntimeError(
+                    error,
+                    runtime: runtime,
+                    conversationID: activeID
+                )
             }
         }
     }
@@ -120,12 +129,22 @@ final class IlumAppModel: ObservableObject {
         isSending = true
         lastError = nil
         status = "Running authorized action…"
+
         Task {
             defer { isSending = false }
             do {
-                apply(try await runtime.approvePermission(pendingID: pendingApproval.id, duration: duration))
+                apply(
+                    try await runtime.approvePermission(
+                        pendingID: pendingApproval.id,
+                        duration: duration
+                    )
+                )
             } catch {
-                await handleRuntimeError(error, runtime: runtime, conversationID: conversationID)
+                await handleRuntimeError(
+                    error,
+                    runtime: runtime,
+                    conversationID: conversationID
+                )
             }
         }
     }
@@ -135,19 +154,24 @@ final class IlumAppModel: ObservableObject {
         isSending = true
         lastError = nil
         status = "Continuing without the action…"
+
         Task {
             defer { isSending = false }
             do {
                 apply(try await runtime.denyPermission(pendingID: pendingApproval.id))
             } catch {
-                await handleRuntimeError(error, runtime: runtime, conversationID: conversationID)
+                await handleRuntimeError(
+                    error,
+                    runtime: runtime,
+                    conversationID: conversationID
+                )
             }
         }
     }
 
     func selectFile() {
-        guard !isSafeMode, !isSending, indexingResourceID == nil, pendingApproval == nil,
-              let fileCatalog, let store else { return }
+        guard !isSafeMode, !isSending, indexingResourceID == nil,
+              pendingApproval == nil, let fileCatalog, let store else { return }
 
         let panel = NSOpenPanel()
         panel.title = "Select a file for Ilum"
@@ -174,8 +198,9 @@ final class IlumAppModel: ObservableObject {
     }
 
     func ingestIntoKnowledge(_ descriptor: UserFileDescriptor) {
-        guard !isSafeMode, !isSending, indexingResourceID == nil, pendingApproval == nil,
-              let knowledgeEngine, let knowledgeStore else { return }
+        guard !isSafeMode, !isSending, indexingResourceID == nil,
+              pendingApproval == nil, let knowledgeEngine,
+              let knowledgeStore else { return }
 
         indexingResourceID = descriptor.id
         status = "Indexing \(descriptor.displayName)…"
@@ -216,18 +241,41 @@ final class IlumAppModel: ObservableObject {
         isKnowledgeAvailable && descriptor.displayName.lowercased().hasSuffix(".pdf")
     }
 
+    /// Removes both the user-file authority and any derived Knowledge/vector copy.
+    /// A direct button click is the user's explicit deletion action; model text can
+    /// never call this path.
     func removeFile(_ descriptor: UserFileDescriptor) {
-        guard !isSafeMode, !isSending, indexingResourceID == nil, pendingApproval == nil,
-              let fileCatalog, let store else { return }
-        do {
-            try fileCatalog.remove(resourceID: descriptor.id)
-            selectedFiles = fileCatalog.allDescriptors()
-            try configureRuntime(store: store, broker: fileCatalog)
-            status = "Ready"
-            lastError = nil
-        } catch {
-            status = "File removal failed"
-            lastError = String(describing: error)
+        guard !isSafeMode, !isSending, indexingResourceID == nil,
+              pendingApproval == nil, let fileCatalog, let store else { return }
+
+        isSending = true
+        lastError = nil
+        status = "Removing \(descriptor.displayName)…"
+
+        Task {
+            defer { isSending = false }
+            do {
+                if let knowledgeStore,
+                   let document = try await knowledgeStore.loadDocument(
+                       sourceResourceID: descriptor.id
+                   ) {
+                    if let vectorIndex {
+                        try await vectorIndex.removeDocument(id: document.id)
+                    }
+                    try await knowledgeStore.removeDocument(
+                        sourceResourceID: descriptor.id
+                    )
+                    knowledgeDocuments = try await knowledgeStore.listDocuments()
+                }
+
+                try fileCatalog.remove(resourceID: descriptor.id)
+                selectedFiles = fileCatalog.allDescriptors()
+                try configureRuntime(store: store, broker: fileCatalog)
+                status = "Ready"
+            } catch {
+                status = "File removal failed"
+                lastError = String(describing: error)
+            }
         }
     }
 
@@ -344,7 +392,8 @@ final class IlumAppModel: ObservableObject {
 
             do {
                 try configureRuntime(store: openedStore, broker: broker)
-                if let runtime, let restored = try? await runtime.loadConversation(id: conversationID) {
+                if let runtime,
+                   let restored = try? await runtime.loadConversation(id: conversationID) {
                     messages = restored.messages
                 }
                 await refreshConversationList()
@@ -358,13 +407,26 @@ final class IlumAppModel: ObservableObject {
     private func resolveLocalModelConfiguration() async {
         let environment = ProcessInfo.processInfo.environment
         let configuredEndpoint = environment["ILUM_MODEL_URL"].flatMap(URL.init(string:))
-        if let configuredEndpoint { modelEndpoint = configuredEndpoint }
+        if let configuredEndpoint {
+            modelEndpoint = configuredEndpoint
+        }
 
         if let configuredName = environment["ILUM_MODEL"]?
             .trimmingCharacters(in: .whitespacesAndNewlines),
            !configuredName.isEmpty {
             modelName = configuredName
             modelStatus = "Model: \(configuredName) — configured"
+            return
+        }
+
+        // A custom non-Ollama OpenAI-compatible server often accepts an arbitrary
+        // model field such as "local". Do not combine an unrelated Ollama-discovered
+        // model name with that explicitly configured endpoint.
+        if let configuredEndpoint,
+           configuredEndpoint.port != 11434,
+           environment["ILUM_OLLAMA_TAGS_URL"] == nil {
+            modelName = "local"
+            modelStatus = "Model: local — custom endpoint"
             return
         }
 
@@ -388,28 +450,31 @@ final class IlumAppModel: ObservableObject {
         store: SQLiteConversationStore,
         broker: any UserFileAccessBroker
     ) throws {
-        let permissions = PermissionEngine(automaticallyAllowedCapabilities: [.readAppData])
-        var registeredTools: [AnyTool] = [AnyTool(ReadTextFileTool(broker: broker))]
+        var registeredTools: [AnyTool] = [
+            AnyTool(ReadTextFileTool(broker: broker))
+        ]
         if let memoryStore {
             registeredTools.append(AnyTool(MemorySearchTool(store: memoryStore)))
             registeredTools.append(AnyTool(MemoryRememberTool(store: memoryStore)))
             registeredTools.append(AnyTool(MemoryForgetTool(store: memoryStore)))
         }
         let registry = try ToolRegistry(tools: registeredTools)
-        let tools = ToolRuntime(registry: registry, permissions: permissions)
+        let tools = ToolRuntime(
+            registry: registry,
+            permissions: permissionEngine
+        )
 
         let contextProvider: (any ModelContextProvider)?
         if let knowledgeStore, let vectorIndex, let embeddingProvider {
-            let sparse = LexicalKnowledgeRetriever(store: knowledgeStore)
             let hybrid = HybridKnowledgeRetriever(
-                sparse: sparse,
+                sparse: knowledgeStore,
                 vectors: vectorIndex,
                 embeddings: embeddingProvider
             )
             contextProvider = KnowledgeModelContextProvider(retriever: hybrid)
         } else if let knowledgeStore {
             contextProvider = KnowledgeModelContextProvider(
-                retriever: LexicalKnowledgeRetriever(store: knowledgeStore)
+                retriever: knowledgeStore
             )
         } else {
             contextProvider = nil
