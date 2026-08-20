@@ -90,16 +90,24 @@ final class SQLiteFTSKnowledgeTests: XCTestCase {
                 ]
             )
 
-            XCTAssertFalse(try await store.search("sentinel phrase", maxHits: 5).isEmpty)
+            let beforeDelete = try await store.search("sentinel phrase", maxHits: 5)
+            XCTAssertFalse(beforeDelete.isEmpty)
+
             try await store.removeDocument(sourceResourceID: resource)
-            XCTAssertNil(try await store.loadDocument(sourceResourceID: resource))
-            XCTAssertTrue(try await store.loadChunks(documentID: documentID).isEmpty)
-            XCTAssertTrue(try await store.search("sentinel phrase", maxHits: 5).isEmpty)
+
+            let removedDocument = try await store.loadDocument(sourceResourceID: resource)
+            let removedChunks = try await store.loadChunks(documentID: documentID)
+            let removedSearch = try await store.search("sentinel phrase", maxHits: 5)
+            XCTAssertNil(removedDocument)
+            XCTAssertTrue(removedChunks.isEmpty)
+            XCTAssertTrue(removedSearch.isEmpty)
         }
 
         let reopened = try SQLiteKnowledgeStore(url: url)
-        XCTAssertNil(try await reopened.loadDocument(sourceResourceID: resource))
-        XCTAssertTrue(try await reopened.search("sentinel phrase", maxHits: 5).isEmpty)
+        let reopenedDocument = try await reopened.loadDocument(sourceResourceID: resource)
+        let reopenedSearch = try await reopened.search("sentinel phrase", maxHits: 5)
+        XCTAssertNil(reopenedDocument)
+        XCTAssertTrue(reopenedSearch.isEmpty)
     }
 
     private func makeDocument(source: String, name: String) -> KnowledgeDocument {
