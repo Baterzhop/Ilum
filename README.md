@@ -10,58 +10,83 @@
 
 Ilum is the canonical successor to Lumi: a local-first personal AI runtime for macOS built around one agent loop, durable local state, grounded knowledge retrieval, permission-gated tools, persistent personal memory, and verifiable citations.
 
-This repository intentionally starts with a clean history. Legacy Lumi versions remain reference material only. There is one product architecture, not parallel Lumi One / V4 engines.
+Legacy Lumi versions are reference material only. Ilum has one product architecture and one integration line instead of parallel Lumi One / V4 engines.
 
-## Product goal
+## What is already in the v1 integration line
 
-Ilum is intended to become a private local personal AI rather than a chat wrapper. The v1 architecture is designed around these capabilities:
-
-- local/offline-first model execution; no cloud API is required by the architecture
-- multilingual conversation with language switching and same-language replies by default
-- durable conversations in SQLite
-- durable Personal Memory for stable facts, preferences, goals, routines, and notes
-- explicit approval before Personal Memory is written or deleted
-- local document Knowledge with provenance-preserving PDF ingestion
-- lexical retrieval that always works plus optional local dense embeddings
+- native SwiftUI `IlumMac` application
+- Swift 6 `IlumCore`
+- one `AgentRuntime`
+- durable multi-conversation SQLite history with New Chat and chat switching
+- durable Personal Memory for facts, preferences, goals, routines, and notes
+- explicit user approval before Personal Memory writes or deletion
+- security-scoped macOS file selection and opaque file resource IDs
+- PDFKit ingestion into a durable Knowledge store
+- persistent SQLite FTS5 sparse retrieval where available, with deterministic Swift lexical fallback
+- optional local Ollama embeddings and persistent Float32 vector index
 - sparse + dense Reciprocal Rank Fusion with automatic sparse fallback
-- bounded context-window management instead of silently overflowing the model
-- exact `[K#]` citation validation against the evidence used for a turn
+- context-window budgeting
+- exact `[K#]` citation validation against the evidence snapshot used for the answer
 - native OpenAI-compatible local model tool calls
-- typed `ToolRuntime` and scoped `PermissionEngine`
-- opaque user-file resource IDs; model output cannot invent filesystem authority
-- security-scoped macOS file bookmarks
-- native SwiftUI macOS client with permission UI, citations, context telemetry, and file/Knowledge controls
+- local Ollama model discovery that rejects embedding-only models as chat candidates
+- explicit unavailable-model behavior instead of fabricated fallback answers
+- multilingual same-language response policy
+- Linux/macOS Core CI plus native macOS build/test/package gates
 
 ## Security invariants
 
-- One `AgentRuntime` owns request execution.
 - User input is persisted before model, retrieval, or tool work.
-- Local files enter through explicit user selection and opaque resource IDs.
+- Local files enter only through explicit user selection and opaque resource IDs.
 - Model-proposed actions never bypass `ToolRuntime` / `PermissionEngine`.
-- Retrieved documents and tool output are data, not higher-authority instructions.
-- Citation markers are validated against the exact context snapshot used for the answer.
-- Personal Memory reads may be locally auto-authorized; writes and deletion require explicit approval.
-- No shell, delete, unrestricted filesystem, arbitrary-network, or self-modification tool is enabled by default.
+- Retrieved documents and tool output are untrusted data, not higher-authority instructions.
+- Personal Memory reads may be allowed by local policy; writes and deletion require explicit approval.
+- Citation markers are validated against the exact grounded-context snapshot for that turn.
+- No shell, unrestricted filesystem, arbitrary-network, or self-modification tool is enabled by default.
 
 ## Repository layout
 
 ```text
 Apps/IlumMac/          Native macOS SwiftUI application
-Packages/IlumCore/    Platform-neutral runtime, storage, RAG, memory, tools, model gateway
+Packages/IlumCore/    Runtime, persistence, RAG, memory, tools, model gateway
+Scripts/              Doctor, run and native .app packaging helpers
 Docs/                  Architecture, status and localized project descriptions
 .github/workflows/     Linux + macOS CI gates
 ```
 
-## Run on macOS
+## Quick start on macOS
 
-Requirements:
+Requirements: macOS 13+, current Xcode Command Line Tools / Swift 6, and a local OpenAI-compatible model server. Ollama is the default local setup.
 
-1. macOS 13 or newer.
-2. Swift 6 / current Xcode command-line tools.
-3. SQLite 3.
-4. A local OpenAI-compatible chat server. Ollama can expose an OpenAI-compatible endpoint.
+From the repository root, first check the machine and local model:
 
-By default Ilum calls localhost endpoints. Override configuration without changing code:
+```bash
+bash Scripts/doctor.sh
+```
+
+For a real local-model smoke request as well:
+
+```bash
+bash Scripts/doctor.sh --chat
+```
+
+Then launch Ilum:
+
+```bash
+bash Scripts/run.sh
+```
+
+Or build a native application bundle:
+
+```bash
+bash Scripts/build-app.sh
+open dist/Ilum.app
+```
+
+When `ILUM_MODEL` is not set, Ilum inspects the local Ollama catalog and deterministically selects a chat-capable model. Embedding/reranker models are excluded from chat selection. No model is downloaded automatically.
+
+### Explicit model configuration
+
+For a specific local model/server:
 
 ```bash
 export ILUM_MODEL_URL="http://127.0.0.1:11434/v1/chat/completions"
@@ -70,14 +95,7 @@ export ILUM_OLLAMA_EMBED_URL="http://127.0.0.1:11434/api/embed"
 export ILUM_EMBED_MODEL="nomic-embed-text"
 ```
 
-Then run:
-
-```bash
-cd Apps/IlumMac
-swift run IlumMac
-```
-
-If dense embeddings are unavailable, Knowledge degrades to lexical retrieval. If the chat model is unavailable, Ilum surfaces the error instead of fabricating a fallback response.
+If dense embeddings are unavailable, Knowledge remains usable through sparse retrieval. If the chat model is unavailable, Ilum reports the failure instead of silently inventing an answer.
 
 ## Context controls
 
@@ -87,10 +105,10 @@ export ILUM_OUTPUT_TOKENS=1024
 export ILUM_CONTEXT_SAFETY_TOKENS=512
 ```
 
-The current turn is never silently dropped. If a request cannot fit safely, the runtime fails explicitly.
+The current user/tool turn is never silently removed. If a request cannot fit safely, the runtime fails explicitly.
 
 ## Release discipline
 
-`main` is intentionally conservative. Work happens in `integration/ilum-v1` through one draft PR. A feature is not called complete because code exists; it must pass Linux Core tests, macOS Core tests, native IlumMac tests/build, and where applicable a physical local-model acceptance session.
+`main` is intentionally conservative. Work happens in `integration/ilum-v1` through one Draft PR. Source code existing is not enough for a release claim: the exact release commit must pass Linux Core tests, macOS Core tests, native `IlumMac` tests/build/package, and a physical macOS local-model acceptance session.
 
 See [Architecture](Docs/ARCHITECTURE.md), [Status](Docs/STATUS.md), [Український опис](Docs/README_UA.md), and [Magyar leírás](Docs/README_HU.md).

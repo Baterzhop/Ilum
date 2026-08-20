@@ -90,8 +90,8 @@ final class SQLiteFTSKnowledgeTests: XCTestCase {
                 ]
             )
 
-            let beforeDelete = try await store.search("sentinel phrase", maxHits: 5)
-            XCTAssertFalse(beforeDelete.isEmpty)
+            let beforeDeletion = try await store.search("sentinel phrase", maxHits: 5)
+            XCTAssertFalse(beforeDeletion.isEmpty)
 
             try await store.removeDocument(sourceResourceID: resource)
 
