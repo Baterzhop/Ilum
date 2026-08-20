@@ -38,6 +38,11 @@ final class IlumAppModel: ObservableObject {
     private var modelEndpoint = URL(string: "http://127.0.0.1:11434/v1/chat/completions")!
     private var modelName: String?
     private var conversationID: UUID
+    private var activeGenerationTask: Task<Void, Never>?
+
+    var canStopGeneration: Bool {
+        isSending && activeGenerationTask != nil && pendingApproval == nil
+    }
 
     init() {
         let defaults = UserDefaults.standard
@@ -110,18 +115,36 @@ final class IlumAppModel: ObservableObject {
         status = "Thinking…"
         let activeID = conversationID
 
-        Task {
-            defer { isSending = false }
+        activeGenerationTask = Task {
+            defer {
+                isSending = false
+                activeGenerationTask = nil
+            }
             do {
                 apply(try await runtime.send(text, conversationID: activeID))
             } catch {
-                await handleRuntimeError(
-                    error,
-                    runtime: runtime,
-                    conversationID: activeID
-                )
+                if Task.isCancelled {
+                    status = "Cancelled"
+                    lastError = nil
+                    if let restored = try? await runtime.loadConversation(id: activeID) {
+                        messages = restored.messages
+                    }
+                    await refreshConversationList()
+                } else {
+                    await handleRuntimeError(
+                        error,
+                        runtime: runtime,
+                        conversationID: activeID
+                    )
+                }
             }
         }
+    }
+
+    func stopGeneration() {
+        guard canStopGeneration, let activeGenerationTask else { return }
+        status = "Cancelling…"
+        activeGenerationTask.cancel()
     }
 
     func approve(_ duration: GrantDuration) {
@@ -419,9 +442,6 @@ final class IlumAppModel: ObservableObject {
             return
         }
 
-        // A custom non-Ollama OpenAI-compatible server often accepts an arbitrary
-        // model field such as "local". Do not combine an unrelated Ollama-discovered
-        // model name with that explicitly configured endpoint.
         if let configuredEndpoint,
            configuredEndpoint.port != 11434,
            environment["ILUM_OLLAMA_TAGS_URL"] == nil {
@@ -545,6 +565,8 @@ final class IlumAppModel: ObservableObject {
     }
 
     private func enterSafeMode(_ reason: String) {
+        activeGenerationTask?.cancel()
+        activeGenerationTask = nil
         runtime = nil
         pendingApproval = nil
         knowledgeEngine = nil
@@ -555,6 +577,7 @@ final class IlumAppModel: ObservableObject {
         isKnowledgeAvailable = false
         isMemoryAvailable = false
         isSafeMode = true
+        isSending = false
         status = "SAFE MODE"
         modelStatus = "Model unavailable in Safe Mode"
         lastError = "Persistent runtime is unavailable. Writes and actions are disabled. \(reason)"
