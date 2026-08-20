@@ -10,6 +10,7 @@ final class IlumAppModel: ObservableObject {
     @Published var messages: [ChatMessage] = []
     @Published var draft = ""
     @Published var status = "Starting…"
+    @Published var modelStatus = "Checking local model…"
     @Published var lastError: String?
     @Published var pendingApproval: PendingToolApproval?
     @Published var selectedFiles: [UserFileDescriptor] = []
@@ -30,6 +31,8 @@ final class IlumAppModel: ObservableObject {
     private var embeddingProvider: OllamaEmbeddingProvider?
     private var knowledgeEngine: HybridKnowledgeIngestionEngine?
     private var memoryStore: SQLitePersonalMemoryStore?
+    private var modelEndpoint = URL(string: "http://127.0.0.1:11434/v1/chat/completions")!
+    private var modelName: String?
     private let conversationID: UUID
 
     init() {
@@ -280,6 +283,8 @@ final class IlumAppModel: ObservableObject {
                 lastError = "User-file access is disabled: \(error)"
             }
 
+            await resolveLocalModelConfiguration()
+
             do {
                 try configureRuntime(store: openedStore, broker: broker)
                 if let runtime, let restored = try? await runtime.loadConversation(id: conversationID) {
@@ -289,6 +294,35 @@ final class IlumAppModel: ObservableObject {
             } catch {
                 enterSafeMode("Runtime initialization failed: \(error)")
             }
+        }
+    }
+
+    private func resolveLocalModelConfiguration() async {
+        let environment = ProcessInfo.processInfo.environment
+        let configuredEndpoint = environment["ILUM_MODEL_URL"].flatMap(URL.init(string:))
+        if let configuredEndpoint { modelEndpoint = configuredEndpoint }
+
+        if let configuredName = environment["ILUM_MODEL"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !configuredName.isEmpty {
+            modelName = configuredName
+            modelStatus = "Model: \(configuredName) — configured"
+            return
+        }
+
+        modelStatus = "Discovering local Ollama models…"
+        do {
+            let installed = try await OllamaModelCatalog().models()
+            if let selected = OllamaModelCatalog.preferredChatModel(from: installed) {
+                modelName = selected.name
+                modelStatus = "Model: \(selected.name) — auto-detected"
+            } else {
+                modelName = nil
+                modelStatus = "Local model unavailable — install an Ollama chat model or set ILUM_MODEL"
+            }
+        } catch {
+            modelName = nil
+            modelStatus = "Local model unavailable — start Ollama or set ILUM_MODEL"
         }
     }
 
@@ -323,7 +357,17 @@ final class IlumAppModel: ObservableObject {
             contextProvider = nil
         }
 
-        let provider = OpenAICompatibleProvider(systemPrompt: makeSystemPrompt())
+        let provider: any ModelProvider
+        if let modelName {
+            provider = OpenAICompatibleProvider(
+                endpoint: modelEndpoint,
+                model: modelName,
+                systemPrompt: makeSystemPrompt()
+            )
+        } else {
+            provider = UnavailableModelProvider(reason: modelStatus)
+        }
+
         runtime = AgentRuntime(
             store: store,
             model: provider,
@@ -368,11 +412,13 @@ final class IlumAppModel: ObservableObject {
         pendingApproval = nil
         knowledgeEngine = nil
         memoryStore = nil
+        modelName = nil
         lastCitations = []
         isKnowledgeAvailable = false
         isMemoryAvailable = false
         isSafeMode = true
         status = "SAFE MODE"
+        modelStatus = "Model unavailable in Safe Mode"
         lastError = "Persistent runtime is unavailable. Writes and actions are disabled. \(reason)"
     }
 }
