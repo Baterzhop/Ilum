@@ -8,6 +8,7 @@ import IlumMacSupport
 @MainActor
 final class IlumAppModel: ObservableObject {
     @Published var messages: [ChatMessage] = []
+    @Published var conversations: [ConversationSummary] = []
     @Published var draft = ""
     @Published var status = "Starting…"
     @Published var modelStatus = "Checking local model…"
@@ -33,11 +34,12 @@ final class IlumAppModel: ObservableObject {
     private var memoryStore: SQLitePersonalMemoryStore?
     private var modelEndpoint = URL(string: "http://127.0.0.1:11434/v1/chat/completions")!
     private var modelName: String?
-    private let conversationID: UUID
+    private var conversationID: UUID
 
     init() {
         let defaults = UserDefaults.standard
-        if let stored = defaults.string(forKey: "ilum.activeConversationID"), let parsed = UUID(uuidString: stored) {
+        if let stored = defaults.string(forKey: "ilum.activeConversationID"),
+           let parsed = UUID(uuidString: stored) {
             conversationID = parsed
         } else {
             let newID = UUID()
@@ -45,6 +47,51 @@ final class IlumAppModel: ObservableObject {
             defaults.set(newID.uuidString, forKey: "ilum.activeConversationID")
         }
         Task { await bootstrap() }
+    }
+
+    func isActiveConversation(_ summary: ConversationSummary) -> Bool {
+        summary.id == conversationID
+    }
+
+    func newConversation() {
+        guard !isSafeMode, !isSending, pendingApproval == nil else { return }
+        activateConversation(UUID())
+        messages = []
+        draft = ""
+        lastError = nil
+        lastCitations = []
+        lastContextBudget = nil
+        status = "New conversation"
+    }
+
+    func selectConversation(_ summary: ConversationSummary) {
+        guard !isSafeMode, !isSending, pendingApproval == nil,
+              summary.id != conversationID, let runtime else { return }
+
+        activateConversation(summary.id)
+        isSending = true
+        lastError = nil
+        lastCitations = []
+        lastContextBudget = nil
+        status = "Loading conversation…"
+
+        Task {
+            defer { isSending = false }
+            do {
+                if let restored = try await runtime.loadConversation(id: summary.id) {
+                    messages = restored.messages
+                    status = "Ready"
+                } else {
+                    messages = []
+                    status = "Conversation not found"
+                    lastError = "The selected conversation no longer exists in local storage."
+                    await refreshConversationList()
+                }
+            } catch {
+                status = "Conversation load failed"
+                lastError = String(describing: error)
+            }
+        }
     }
 
     func send() {
@@ -56,12 +103,14 @@ final class IlumAppModel: ObservableObject {
         lastCitations = []
         lastContextBudget = nil
         status = "Thinking…"
+        let activeID = conversationID
+
         Task {
             defer { isSending = false }
             do {
-                apply(try await runtime.send(text, conversationID: conversationID))
+                apply(try await runtime.send(text, conversationID: activeID))
             } catch {
-                await handleRuntimeError(error, runtime: runtime)
+                await handleRuntimeError(error, runtime: runtime, conversationID: activeID)
             }
         }
     }
@@ -76,7 +125,7 @@ final class IlumAppModel: ObservableObject {
             do {
                 apply(try await runtime.approvePermission(pendingID: pendingApproval.id, duration: duration))
             } catch {
-                await handleRuntimeError(error, runtime: runtime)
+                await handleRuntimeError(error, runtime: runtime, conversationID: conversationID)
             }
         }
     }
@@ -91,7 +140,7 @@ final class IlumAppModel: ObservableObject {
             do {
                 apply(try await runtime.denyPermission(pendingID: pendingApproval.id))
             } catch {
-                await handleRuntimeError(error, runtime: runtime)
+                await handleRuntimeError(error, runtime: runtime, conversationID: conversationID)
             }
         }
     }
@@ -186,24 +235,32 @@ final class IlumAppModel: ObservableObject {
         switch outcome {
         case .completed(let response):
             pendingApproval = nil
+            activateConversation(response.conversation.id)
             messages = response.conversation.messages
             lastCitations = response.citations
             lastContextBudget = response.contextBudget
             status = "Ready"
         case .permissionRequired(let pending):
             pendingApproval = pending
+            activateConversation(pending.conversation.id)
             messages = pending.conversation.messages
             status = "Permission required"
         }
+        Task { await refreshConversationList() }
     }
 
-    private func handleRuntimeError(_ error: Error, runtime: AgentRuntime) async {
+    private func handleRuntimeError(
+        _ error: Error,
+        runtime: AgentRuntime,
+        conversationID: UUID
+    ) async {
         lastError = String(describing: error)
         lastCitations = []
         status = "Runtime error"
         if let restored = try? await runtime.loadConversation(id: conversationID) {
             messages = restored.messages
         }
+        await refreshConversationList()
     }
 
     private func bootstrap() async {
@@ -290,6 +347,7 @@ final class IlumAppModel: ObservableObject {
                 if let runtime, let restored = try? await runtime.loadConversation(id: conversationID) {
                     messages = restored.messages
                 }
+                await refreshConversationList()
                 status = fileCatalog == nil ? "Ready — file access disabled" : "Ready"
             } catch {
                 enterSafeMode("Runtime initialization failed: \(error)")
@@ -407,12 +465,27 @@ final class IlumAppModel: ObservableObject {
         return prompt
     }
 
+    private func activateConversation(_ id: UUID) {
+        conversationID = id
+        UserDefaults.standard.set(id.uuidString, forKey: "ilum.activeConversationID")
+    }
+
+    private func refreshConversationList() async {
+        guard let store else { return }
+        do {
+            conversations = try await store.listConversations(limit: 100)
+        } catch {
+            lastError = "Conversation catalog could not be loaded: \(error)"
+        }
+    }
+
     private func enterSafeMode(_ reason: String) {
         runtime = nil
         pendingApproval = nil
         knowledgeEngine = nil
         memoryStore = nil
         modelName = nil
+        conversations = []
         lastCitations = []
         isKnowledgeAvailable = false
         isMemoryAvailable = false

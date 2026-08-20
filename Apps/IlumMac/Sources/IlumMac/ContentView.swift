@@ -65,6 +65,36 @@ struct ContentView: View {
             Spacer()
 
             Button {
+                model.newConversation()
+            } label: {
+                Label("New Chat", systemImage: "square.and.pencil")
+            }
+            .disabled(model.isSafeMode || model.isSending || model.pendingApproval != nil)
+
+            Menu {
+                if model.conversations.isEmpty {
+                    Text("No saved conversations")
+                } else {
+                    ForEach(model.conversations) { summary in
+                        Button {
+                            model.selectConversation(summary)
+                        } label: {
+                            Label(
+                                summary.title,
+                                systemImage: model.isActiveConversation(summary)
+                                    ? "checkmark.circle.fill"
+                                    : "bubble.left"
+                            )
+                        }
+                        .disabled(model.isActiveConversation(summary))
+                    }
+                }
+            } label: {
+                Label("Chats", systemImage: "bubble.left.and.bubble.right")
+            }
+            .disabled(model.isSafeMode || model.isSending || model.pendingApproval != nil)
+
+            Button {
                 model.selectFile()
             } label: {
                 Label("Select File…", systemImage: "doc.badge.plus")
