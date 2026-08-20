@@ -7,6 +7,12 @@ public protocol KnowledgeStore: Sendable {
     func replaceDocument(_ document: KnowledgeDocument, chunks: [KnowledgeChunk]) async throws
 }
 
+/// Optional mutation capability kept separate from the read/replace store contract
+/// so test stores and read-only adapters do not acquire deletion authority implicitly.
+public protocol MutableKnowledgeStore: KnowledgeStore {
+    func removeDocument(sourceResourceID: UserFileResourceID) async throws
+}
+
 public actor KnowledgeIngestionEngine {
     private let extractor: any DocumentTextExtractor
     private let store: any KnowledgeStore
