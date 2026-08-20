@@ -1,58 +1,88 @@
-# Ilum v1 status
+# Ilum status
 
-Updated: 2026-08-20
+This file separates implemented code from verified behavior and future work. A feature is not considered production-ready solely because source code exists.
 
-## Implemented in `integration/ilum-v1`
+## Canonical line
 
-- [x] clean canonical repository and single integration branch
-- [x] Swift 6 `IlumCore`
-- [x] single `AgentRuntime`
-- [x] durable conversation persistence in SQLite
-- [x] visible storage Safe Mode
-- [x] native OpenAI-compatible chat/tool-call transport
-- [x] typed ToolRegistry / ToolRuntime
-- [x] scoped one-time/session permissions
-- [x] opaque user-file resource boundary
-- [x] macOS security-scoped bookmark catalog
-- [x] protected UTF-8 file-read tool
-- [x] PDFKit text extraction
-- [x] deterministic chunking with page provenance
-- [x] durable Knowledge store
-- [x] deterministic lexical grounded retrieval
-- [x] bounded untrusted grounded context
-- [x] fail-closed citation validation
-- [x] context-window budgeting
-- [x] optional Ollama embedding provider
-- [x] persistent Float32 vector index
-- [x] sparse+dense Reciprocal Rank Fusion
-- [x] sparse fallback if dense retrieval fails
-- [x] native SwiftUI macOS client
-- [x] permission UI
-- [x] PDF Knowledge indexing UI
-- [x] source citation UI
-- [x] context-budget telemetry
-- [x] Linux/macOS Core CI definitions
-- [x] macOS app test/build CI definition
+- Repository: `Baterzhop/Ilum`
+- Integration branch: `integration/ilum-v1`
+- Pull request: `#1`
+- Default branch: `main`
+- Architecture rule: no parallel V-number engines; all product work converges into this line.
 
-## Release blockers
+## Implemented in the integration branch
 
-The branch is intentionally not merged to `main` until these are evidenced, not merely assumed:
+| Area | State | Notes |
+| --- | --- | --- |
+| Swift 6 core | Implemented | `Packages/IlumCore` |
+| Native macOS app | Implemented | SwiftUI executable in `Apps/IlumMac` |
+| Conversation persistence | Implemented | SQLite, survives reopen |
+| Safe storage bootstrap | Implemented | critical conversation-store failure enters Safe Mode |
+| Local model transport | Implemented | OpenAI-compatible endpoint, explicit failures |
+| Tool protocol/runtime | Implemented | typed registry and structured results |
+| Permission engine | Implemented | exact capability/resource grants; one-time/session grants |
+| User-file boundary | Implemented | security-scoped selection + opaque resource IDs |
+| PDF text ingestion | Implemented | PDFKit; scanned/image-only PDFs are not falsely treated as extracted text |
+| Knowledge store | Implemented | SQLite document/chunk provenance |
+| Lexical retrieval | Implemented | deterministic local baseline |
+| Dense retrieval | Implemented | optional local Ollama embeddings + persistent vector index |
+| Hybrid fusion | Implemented | Reciprocal Rank Fusion with sparse fallback |
+| Context budgeting | Implemented | current turn is never silently removed |
+| Grounded citations | Implemented | `[K#]` markers validated against exact evidence snapshot |
+| Personal Memory | Implemented | dedicated SQLite store; read-only lookup may be local-policy allowed, writes/deletion require approval |
+| Multilingual policy | Implemented at runtime-prompt level | model capability still determines language quality |
+| CI | Implemented | Linux Core, macOS Core, macOS app tests/build |
 
-- [ ] GitHub Linux `IlumCore` test job is green on the current head.
-- [ ] GitHub macOS `IlumCore` test job is green on the current head.
-- [ ] GitHub macOS `IlumMac` test + build job is green on the current head.
-- [ ] Physical macOS run opens the app and restores a conversation after restart.
-- [ ] Physical local-model run produces a normal chat response.
-- [ ] Physical permission flow proves selected file content is unavailable to the model until approval.
-- [ ] Physical PDF test indexes a document, retrieves evidence, and renders only validated `[K#]` citations.
-- [ ] Dense-offline test confirms sparse retrieval still answers Knowledge queries.
+## Verification gates
 
-## Explicit non-claims
+Automated CI must stay green for every integration commit:
 
-The current code does not claim scanned-PDF OCR, ANN/HNSW scale, cloud sync, voice/avatar, autonomous web browsing, shell access, arbitrary external actions, or self-modifying code.
+1. `IlumCore tests (Linux)`
+2. `IlumCore tests (macOS)`
+3. `IlumMac build + tests (macOS)`
 
-Token streaming / STOP cancellation from the experimental V4 line has not yet been promoted into the canonical AgentRuntime because the first Ilum v1 release prioritizes a single safe tool/permission protocol. It should be added only without creating a second execution engine.
+The runtime/app foundation has passed all three gates. Newly added features must pass the same gates before they are treated as verified.
 
-## Legacy source policy
+## Physical acceptance still required before v1 release
 
-`Baterzhop/LumiOrigin` is reference material. New production work belongs in `Baterzhop/Ilum`; Lumi One/V3/V4 branches are not separate product tracks anymore.
+GitHub Actions cannot prove hardware-local model behavior on the user's Mac. Before merging v1 to `main`, perform a physical acceptance session that verifies:
+
+- local model server discovery/configuration;
+- real chat response from a local installed model;
+- restart restores conversation;
+- `memory.remember` pauses for approval and survives restart;
+- `memory.search` can retrieve the approved memory;
+- selecting a text file creates only an opaque resource ID for the model;
+- `file.readText` pauses for approval before file content reaches the model;
+- PDF indexing survives restart;
+- a document question retrieves the expected page/chunk and renders only validated citations;
+- dense embedding failure visibly degrades to lexical retrieval;
+- model-server failure is visible and never replaced by a fabricated assistant answer.
+
+## Deliberate non-claims
+
+The following are not yet release claims:
+
+- no scanned-PDF OCR yet;
+- no voice pipeline yet;
+- no avatar yet;
+- no unrestricted browser/network agent;
+- no shell execution;
+- no delete/arbitrary filesystem authority;
+- no autonomous self-rewriting;
+- no production Developer Agent yet;
+- no background autonomous task scheduler yet;
+- no cloud sync dependency.
+
+These capabilities may be added only through explicit contracts, permission policy, tests, and an acceptance gate. Direct self-modification from arbitrary model output remains prohibited.
+
+## Definition of v1 release
+
+Ilum v1 can move from draft integration to `main` when:
+
+- all automated gates are green on the exact release commit;
+- physical macOS local-model acceptance is completed;
+- Personal Memory write/delete approval is demonstrated;
+- PDF Knowledge + citation flow is demonstrated;
+- no critical open security regression remains;
+- README and localized documentation match actual behavior.
