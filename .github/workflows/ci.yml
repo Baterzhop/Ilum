@@ -56,3 +56,13 @@ jobs:
         run: |
           test -x dist/Ilum.app/Contents/MacOS/IlumMac
           plutil -lint dist/Ilum.app/Contents/Info.plist
+          codesign --verify --deep --strict dist/Ilum.app
+      - name: Archive Ilum.app
+        run: ditto -c -k --sequesterRsrc --keepParent dist/Ilum.app dist/Ilum.app.zip
+      - name: Upload Ilum macOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Ilum-macOS
+          path: dist/Ilum.app.zip
+          if-no-files-found: error
+          retention-days: 14
