@@ -3,9 +3,12 @@ name: Ilum CI
 on:
   push:
     branches:
-      - integration/ilum-v1
       - main
   pull_request:
+
+concurrency:
+  group: ilum-ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
