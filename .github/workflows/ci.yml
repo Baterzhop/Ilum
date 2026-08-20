@@ -17,7 +17,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Validate helper scripts
-        run: bash -n Scripts/doctor.sh Scripts/run.sh
+        run: bash -n Scripts/doctor.sh Scripts/run.sh Scripts/build-app.sh
       - name: Install SQLite headers
         run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
       - name: Swift version
@@ -50,3 +50,9 @@ jobs:
       - name: Build IlumMac
         working-directory: Apps/IlumMac
         run: swift build
+      - name: Package Ilum.app
+        run: bash Scripts/build-app.sh
+      - name: Verify app bundle
+        run: |
+          test -x dist/Ilum.app/Contents/MacOS/IlumMac
+          plutil -lint dist/Ilum.app/Contents/Info.plist
