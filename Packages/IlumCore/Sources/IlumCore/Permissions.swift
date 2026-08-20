@@ -58,6 +58,18 @@ public struct PermissionRequest: Identifiable, Equatable, Sendable {
         self.resourceDisplayName = resourceDisplayName
         self.resourceLocationHint = resourceLocationHint
     }
+
+    /// Session grants are deliberately limited to read-only capabilities.
+    /// Writes, external actions, system commands and code changes must receive a
+    /// fresh user decision for every concrete tool execution.
+    public var allowsSessionGrant: Bool {
+        switch capability {
+        case .readAppData, .readUserFile:
+            return true
+        case .writeAppData, .writeUserFile, .externalAction, .systemCommand, .modifyCode:
+            return false
+        }
+    }
 }
 
 public struct PermissionGrant: Identifiable, Equatable, Sendable {
@@ -90,7 +102,13 @@ public actor PermissionEngine {
             .filter { $0.capability == request.capability && $0.resource == request.resource }
             .map(\.id)
         for id in duplicates { grants.removeValue(forKey: id) }
-        let grant = PermissionGrant(capability: request.capability, resource: request.resource, duration: duration)
+
+        let effectiveDuration: GrantDuration = request.allowsSessionGrant ? duration : .once
+        let grant = PermissionGrant(
+            capability: request.capability,
+            resource: request.resource,
+            duration: effectiveDuration
+        )
         grants[grant.id] = grant
         return grant
     }

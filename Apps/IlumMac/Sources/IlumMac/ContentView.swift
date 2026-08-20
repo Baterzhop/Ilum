@@ -259,8 +259,10 @@ struct ContentView: View {
             HStack {
                 Button("Allow once") { model.approve(.once) }
                     .disabled(model.isSending)
-                Button("Allow for session") { model.approve(.session) }
-                    .disabled(model.isSending)
+                if pending.permission.allowsSessionGrant {
+                    Button("Allow for session") { model.approve(.session) }
+                        .disabled(model.isSending)
+                }
                 Button("Deny", role: .cancel) { model.deny() }
                     .disabled(model.isSending)
                 Spacer()
