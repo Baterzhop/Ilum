@@ -53,7 +53,8 @@ public actor HybridKnowledgeRetriever: KnowledgeRetriever {
             hitsByID[hit.chunkID] = hitsByID[hit.chunkID] ?? hit
             scores[hit.chunkID, default: 0] += policy.denseWeight / Double(policy.rrfK + rank + 1)
         }
-        return scores.compactMap { id, score -> KnowledgeHit? in
+        return scores.compactMap { entry -> KnowledgeHit? in
+            let (id, score) = entry
             guard let h = hitsByID[id] else { return nil }
             return KnowledgeHit(documentID: h.documentID, sourceResourceID: h.sourceResourceID, displayName: h.displayName, chunkID: h.chunkID, chunkOrdinal: h.chunkOrdinal, pageStart: h.pageStart, pageEnd: h.pageEnd, score: score, text: h.text)
         }.sorted {

@@ -5,10 +5,13 @@ final class IlumCoreTests: XCTestCase {
     func testPermissionRequiresExplicitGrantAndOnceIsConsumed() async throws {
         let engine = PermissionEngine()
         let request = PermissionRequest(capability: .readUserFile, resource: .userFile(UserFileResourceID(rawValue: "r1")), reason: "test")
-        XCTAssertFalse(await engine.authorize(request))
+        let before = await engine.authorize(request)
+        XCTAssertFalse(before)
         _ = await engine.grant(request, duration: .once)
-        XCTAssertTrue(await engine.authorize(request))
-        XCTAssertFalse(await engine.authorize(request))
+        let first = await engine.authorize(request)
+        let second = await engine.authorize(request)
+        XCTAssertTrue(first)
+        XCTAssertFalse(second)
     }
 
     func testContextBudgetKeepsNewestMessageAndTrimsHistory() {
@@ -70,18 +73,16 @@ final class IlumCoreTests: XCTestCase {
     }
 
     private func temporaryURL(_ name: String) -> URL {
-        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("ilum-tests-\(UUID().uuidString)", isDirectory: true)
-        return dir.appendingPathComponent(name)
+        FileManager.default.temporaryDirectory
+            .appendingPathComponent("ilum-tests-\(UUID().uuidString)", isDirectory: true)
+            .appendingPathComponent(name)
     }
 }
 
 private actor MemoryKnowledgeStore: KnowledgeStore {
     private var documents: [UUID: KnowledgeDocument] = [:]
     private var chunks: [UUID: [KnowledgeChunk]] = [:]
-
-    func loadDocument(sourceResourceID: UserFileResourceID) async throws -> KnowledgeDocument? {
-        documents.values.first { $0.sourceResourceID == sourceResourceID }
-    }
+    func loadDocument(sourceResourceID: UserFileResourceID) async throws -> KnowledgeDocument? { documents.values.first { $0.sourceResourceID == sourceResourceID } }
     func loadChunks(documentID: UUID) async throws -> [KnowledgeChunk] { chunks[documentID] ?? [] }
     func listDocuments() async throws -> [KnowledgeDocument] { Array(documents.values) }
     func replaceDocument(_ document: KnowledgeDocument, chunks newChunks: [KnowledgeChunk]) async throws {
