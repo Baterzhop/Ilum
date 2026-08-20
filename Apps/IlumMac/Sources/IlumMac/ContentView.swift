@@ -143,8 +143,8 @@ struct ContentView: View {
                                 .foregroundStyle(.secondary)
                         }
                         .buttonStyle(.plain)
-                        .help("Remove this file from Ilum")
-                        .disabled(model.indexingResourceID != nil)
+                        .help("Remove this file and its indexed Knowledge from Ilum")
+                        .disabled(model.indexingResourceID != nil || model.isSending)
                     }
                     .font(.caption)
                     .padding(.horizontal, 9)
@@ -286,14 +286,21 @@ struct ContentView: View {
                     .disabled(model.isSafeMode || model.isSending || model.pendingApproval != nil)
                     .onSubmit { model.send() }
 
-                Button("Send") { model.send() }
-                    .keyboardShortcut(.return, modifiers: .command)
-                    .disabled(
-                        model.isSafeMode ||
-                        model.isSending ||
-                        model.pendingApproval != nil ||
-                        model.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                    )
+                if model.canStopGeneration {
+                    Button("Stop", role: .cancel) {
+                        model.stopGeneration()
+                    }
+                    .keyboardShortcut(.escape, modifiers: [])
+                } else {
+                    Button("Send") { model.send() }
+                        .keyboardShortcut(.return, modifiers: .command)
+                        .disabled(
+                            model.isSafeMode ||
+                            model.isSending ||
+                            model.pendingApproval != nil ||
+                            model.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                        )
+                }
             }
         }
         .padding()
