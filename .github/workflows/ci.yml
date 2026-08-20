@@ -34,3 +34,17 @@ jobs:
       - name: Test IlumCore
         working-directory: Packages/IlumCore
         run: swift test
+
+  mac-app:
+    name: IlumMac build + tests (macOS)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Swift version
+        run: swift --version
+      - name: Test IlumMac support
+        working-directory: Apps/IlumMac
+        run: swift test
+      - name: Build IlumMac
+        working-directory: Apps/IlumMac
+        run: swift build
