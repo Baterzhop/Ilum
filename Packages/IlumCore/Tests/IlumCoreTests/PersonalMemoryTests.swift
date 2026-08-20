@@ -26,9 +26,12 @@ final class PersonalMemoryTests: XCTestCase {
 
         let reopened = try SQLitePersonalMemoryStore(url: url)
         let results = try await reopened.search("concise technical", limit: 5)
-        XCTAssertEqual(results.first?.id, firstID)
-        XCTAssertEqual(results.first?.importance, 0.9, accuracy: 0.0001)
-        XCTAssertEqual(results.first?.tags, ["style"])
+        guard let first = results.first else {
+            return XCTFail("Expected persisted personal memory")
+        }
+        XCTAssertEqual(first.id, firstID)
+        XCTAssertEqual(first.importance, 0.9, accuracy: 0.0001)
+        XCTAssertEqual(first.tags, ["style"])
     }
 
     func testMemoryReadCanBeAutoAllowedButWriteStillRequiresApproval() async throws {
