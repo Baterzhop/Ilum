@@ -63,7 +63,11 @@ final class PersonalMemoryTests: XCTestCase {
             return XCTFail("Personal Memory writes must require explicit permission")
         }
 
-        _ = await runtime.grant(request, duration: .once)
+        _ = await runtime.grant(
+            request,
+            duration: .once,
+            callID: rememberCall.id
+        )
         let approved = try await runtime.execute(rememberCall)
         guard case .success = approved else {
             return XCTFail("The exact approved memory write should execute")
