@@ -234,15 +234,25 @@ public actor ToolRuntime {
         return try tool.permissionRequest(arguments: call.arguments)
     }
 
-    @discardableResult public func grant(_ request: PermissionRequest, duration: GrantDuration) async -> PermissionGrant {
-        await permissions.grant(request, duration: duration)
+    /// Grants authority for a concrete ToolCall. One-shot authority is bound to
+    /// `callID`; session read authority remains scoped by capability + resource.
+    @discardableResult
+    public func grant(
+        _ request: PermissionRequest,
+        duration: GrantDuration,
+        callID: UUID? = nil
+    ) async -> PermissionGrant {
+        await permissions.grant(request, duration: duration, executionID: callID)
     }
+
     public func execute(_ call: ToolCall) async throws -> ToolExecutionOutcome {
         let request = try permissionRequest(for: call)
         guard let tool = registry.resolve(name: call.name, version: call.version) else {
             throw ToolRuntimeError.unknownTool(name: call.name, version: call.version)
         }
-        guard await permissions.authorize(request) else { return .permissionRequired(request) }
+        guard await permissions.authorize(request, executionID: call.id) else {
+            return .permissionRequired(request)
+        }
         let result = try await tool.execute(arguments: call.arguments)
         return .success(ToolExecutionSuccess(callID: call.id, descriptor: tool.descriptor, data: result.data, warnings: result.warnings, metadata: result.metadata))
     }

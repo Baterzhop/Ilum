@@ -77,14 +77,25 @@ public struct PermissionGrant: Identifiable, Equatable, Sendable {
     public let capability: ToolCapability
     public let resource: ResourceScope
     public let duration: GrantDuration
+    /// A one-shot grant is bound to one concrete execution identity. Session
+    /// read grants deliberately leave this nil and remain resource-scoped.
+    public let executionID: UUID?
     public let createdAt: Date
 
     public init(
-        id: UUID = UUID(), capability: ToolCapability, resource: ResourceScope,
-        duration: GrantDuration, createdAt: Date = Date()
+        id: UUID = UUID(),
+        capability: ToolCapability,
+        resource: ResourceScope,
+        duration: GrantDuration,
+        executionID: UUID? = nil,
+        createdAt: Date = Date()
     ) {
-        self.id = id; self.capability = capability; self.resource = resource
-        self.duration = duration; self.createdAt = createdAt
+        self.id = id
+        self.capability = capability
+        self.resource = resource
+        self.duration = duration
+        self.executionID = executionID
+        self.createdAt = createdAt
     }
 }
 
@@ -96,18 +107,44 @@ public actor PermissionEngine {
         self.automaticallyAllowedCapabilities = automaticallyAllowedCapabilities
     }
 
+    /// Creates an authorization grant. For one-shot grants, `executionID` must
+    /// identify the concrete ToolCall/execution being approved. Direct callers
+    /// that do not supply one are safely bound to this PermissionRequest's ID.
+    /// Session grants remain resource-scoped and are available only to read-only
+    /// capabilities through `PermissionRequest.allowsSessionGrant`.
     @discardableResult
-    public func grant(_ request: PermissionRequest, duration: GrantDuration) -> PermissionGrant {
-        let duplicates = grants.values
-            .filter { $0.capability == request.capability && $0.resource == request.resource }
-            .map(\.id)
+    public func grant(
+        _ request: PermissionRequest,
+        duration: GrantDuration,
+        executionID: UUID? = nil
+    ) -> PermissionGrant {
+        let effectiveDuration: GrantDuration = request.allowsSessionGrant ? duration : .once
+        let effectiveExecutionID = effectiveDuration == .once
+            ? (executionID ?? request.id)
+            : nil
+
+        let duplicates = grants.values.filter { existing in
+            guard existing.capability == request.capability,
+                  existing.resource == request.resource else { return false }
+            switch effectiveDuration {
+            case .session:
+                // A session read grant subsumes previous grants for this exact
+                // capability/resource for the remainder of the session.
+                return true
+            case .once:
+                // Distinct concrete executions on the same resource must be able
+                // to coexist without replacing each other's approval.
+                return existing.duration == .once &&
+                    existing.executionID == effectiveExecutionID
+            }
+        }.map(\.id)
         for id in duplicates { grants.removeValue(forKey: id) }
 
-        let effectiveDuration: GrantDuration = request.allowsSessionGrant ? duration : .once
         let grant = PermissionGrant(
             capability: request.capability,
             resource: request.resource,
-            duration: effectiveDuration
+            duration: effectiveDuration,
+            executionID: effectiveExecutionID
         )
         grants[grant.id] = grant
         return grant
@@ -116,16 +153,39 @@ public actor PermissionEngine {
     public func revoke(grantID: UUID) { grants.removeValue(forKey: grantID) }
     public func revokeAll() { grants.removeAll() }
 
-    public func authorize(_ request: PermissionRequest) -> Bool {
+    /// Authorizes one concrete execution. A session read grant can authorize any
+    /// matching execution in the same session. A one-shot grant must match both
+    /// capability/resource and the exact execution identity, so approval for one
+    /// ToolCall cannot be consumed by a concurrent call on the same resource.
+    public func authorize(
+        _ request: PermissionRequest,
+        executionID: UUID? = nil
+    ) -> Bool {
         if automaticallyAllowedCapabilities.contains(request.capability) {
             return true
         }
+
+        if grants.values.contains(where: {
+            $0.duration == .session &&
+            $0.capability == request.capability &&
+            $0.resource == request.resource
+        }) {
+            return true
+        }
+
+        let requiredExecutionID = executionID ?? request.id
         guard let match = grants.values.first(where: {
-            $0.capability == request.capability && $0.resource == request.resource
+            $0.duration == .once &&
+            $0.capability == request.capability &&
+            $0.resource == request.resource &&
+            $0.executionID == requiredExecutionID
         }) else { return false }
-        if match.duration == .once { grants.removeValue(forKey: match.id) }
+
+        grants.removeValue(forKey: match.id)
         return true
     }
 
-    public func activeGrants() -> [PermissionGrant] { grants.values.sorted { $0.createdAt < $1.createdAt } }
+    public func activeGrants() -> [PermissionGrant] {
+        grants.values.sorted { $0.createdAt < $1.createdAt }
+    }
 }

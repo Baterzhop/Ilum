@@ -23,12 +23,13 @@ This file separates implemented code from verified behavior and future work. A f
 | Pending resolution isolation | Implemented | duplicate concurrent approve/deny for the same pending transaction fails fast |
 | Durable permission-turn recovery | Implemented | pending ToolCall + exact grounded evidence survive restart; approval UI is restored |
 | Permission restore revalidation | Implemented | live tool recomputes permission request; stored capability/resource mismatch fails closed |
+| Permission execution binding | Implemented | one-shot grants are bound to the exact `ToolCall.id`; session grants remain read-only and resource-scoped |
 | Versioned conversation migrations | Implemented | numbered SQLite migrations; unknown newer or non-contiguous migration ledger fails closed |
 | Safe storage bootstrap | Implemented | critical conversation-store failure enters Safe Mode |
 | Local model transport | Implemented | OpenAI-compatible endpoint, explicit failures |
 | Local Ollama discovery | Implemented | deterministic chat-model selection; embedding-only models rejected |
 | Tool protocol/runtime | Implemented | typed registry and structured results |
-| Permission engine | Implemented | exact capability/resource grants; session grants limited to read-only capabilities |
+| Permission engine | Implemented | session read authority scoped by capability/resource; one-shot authority additionally scoped to exact execution |
 | User-file boundary | Implemented | security-scoped selection + opaque resource IDs |
 | PDF text ingestion | Implemented | PDFKit; scanned/image-only PDFs are not falsely treated as extracted text |
 | Knowledge store | Implemented | SQLite document/chunk provenance + explicit deletion |
@@ -63,6 +64,9 @@ Regression coverage includes:
 - same-conversation concurrent turns fail before a second user message can persist;
 - different conversations remain independently runnable rather than being globally serialized;
 - permission continuation keeps the same-conversation run lease even after the durable pending row has been transactionally deleted;
+- one-shot permission for ToolCall A cannot authorize ToolCall B even when both request the same capability/resource;
+- distinct approved one-shot calls on the same resource coexist rather than replacing each other;
+- session read grants remain reusable across matching executions;
 - restart-safe permission turns;
 - approval after restart with preservation of the original grounded-context snapshot;
 - denial after restart with preservation of the original grounded-context snapshot, no tool data read, durable denial history and pending-record cleanup;

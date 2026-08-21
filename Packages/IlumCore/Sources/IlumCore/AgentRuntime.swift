@@ -101,7 +101,11 @@ public actor AgentRuntime {
             defer { endConversationRun(pending.conversationID) }
 
             let livePermission = try await validatedPermission(for: pending)
-            _ = await toolRuntime.grant(livePermission, duration: duration)
+            _ = await toolRuntime.grant(
+                livePermission,
+                duration: duration,
+                callID: pending.call.id
+            )
             phase = .executingTool
 
             switch try await toolRuntime.execute(pending.call) {

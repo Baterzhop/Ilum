@@ -53,7 +53,14 @@ For a restored pending action, `ToolRuntime` recomputes the permission request f
 
 ### PermissionEngine
 
-Grants are scoped by capability + exact resource and by duration (`once` or `session`). Chat prose cannot create a grant. A one-time grant is consumed by authorization. Session grants are limited to read-only capabilities; writes and other side effects require a fresh one-shot decision.
+Permission identity has two deliberately different scopes:
+
+- **Session read grants** are scoped to `capability + exact resource`. They are allowed only for read-only capabilities and may authorize later matching reads during that application session.
+- **One-shot grants** are scoped to `capability + exact resource + concrete execution ID`. `ToolRuntime` uses the internal persisted `ToolCall.id` as that execution ID. A one-shot approval for call A therefore cannot be consumed by concurrent call B even if both calls request the same file or app-data resource.
+
+Chat prose cannot create a grant. A one-shot grant is consumed only by its matching concrete execution. Distinct approved one-shot calls on the same resource can coexist without replacing each other. Writes and other side effects always resolve to one-shot authority and require a fresh user decision for every concrete ToolCall.
+
+The user-facing `PermissionRequest.id` is presentation/audit identity, not execution authority. This distinction is required because a restored permission request is recomputed after restart and may receive a fresh request UUID while the durable `ToolCall.id` remains stable.
 
 ### User files
 
@@ -81,10 +88,11 @@ A permission pause is a durable runtime state, not a transient UI modal:
 
 1. user input is persisted before model/tool work;
 2. ToolCall + permission gate + evidence snapshot are persisted before the approval is exposed;
-3. restart restores the same pending ID and grounded evidence;
+3. restart restores the same pending ID, concrete ToolCall ID and grounded evidence;
 4. the live tool recomputes the permission request before approval can execute;
-5. approval/denial resolution is persisted transactionally with the tool-history event;
-6. the conversation run lease remains held until the resumed model continuation completes or fails.
+5. an approval grant is bound to the persisted ToolCall ID for one-shot authority;
+6. approval/denial resolution is persisted transactionally with the tool-history event;
+7. the conversation run lease remains held until the resumed model continuation completes or fails.
 
 Current v1 side-effect tools are local Personal Memory writes/deletion; those operations are idempotent under retry. Future external side-effect tools must add an execution/idempotency ledger before they are admitted to production authority.
 
