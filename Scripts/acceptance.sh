@@ -13,7 +13,7 @@ Usage: bash Scripts/acceptance.sh [--guided] [--auto-only] [--no-launch]
 
   --guided     Run the physical acceptance checklist interactively.
   --auto-only  Run only automated local checks; do not launch Ilum.
-  --no-launch  Build and verify Ilum.app but do not open it.
+  --no-launch  Build and verify Ilum.app but do not launch either app path.
 USAGE
 }
 
@@ -46,6 +46,7 @@ MANUAL_TOTAL=0
 MANUAL_PASSES=0
 MANUAL_FAILURES=0
 MANUAL_SKIPS=0
+BUILD_OK=0
 
 append() { printf '%s\n' "$*" >> "$REPORT"; }
 
@@ -62,6 +63,19 @@ record_auto() {
   fi
 }
 
+append_log_details() {
+  local label="$1" log="$2"
+  append ""
+  append "<details><summary>$label output</summary>"
+  append ""
+  append '```text'
+  cat "$log" >> "$REPORT"
+  append '```'
+  append ""
+  append '</details>'
+  append ""
+}
+
 run_check() {
   local label="$1"
   shift
@@ -74,17 +88,50 @@ run_check() {
     status=$?
     record_auto FAIL "$label" "exit $status"
   fi
-  append ""
-  append "<details><summary>$label output</summary>"
-  append ""
-  append '```text'
-  cat "$log" >> "$REPORT"
-  append '```'
-  append ""
-  append '</details>'
-  append ""
+  append_log_details "$label" "$log"
   rm -f "$log"
   return "$status"
+}
+
+run_source_launch_smoke() {
+  local label="Source launch via Scripts/run.sh"
+  local log launcher_pid attempts pids status
+  log="$(mktemp)"
+  bash "$ROOT/Scripts/run.sh" >"$log" 2>&1 &
+  launcher_pid=$!
+  attempts=0
+
+  while [[ "$attempts" -lt 120 ]]; do
+    pids="$(pgrep -x IlumMac 2>/dev/null || true)"
+    if [[ -n "$pids" ]]; then
+      record_auto PASS "$label" "IlumMac process started from swift run"
+      kill $pids >/dev/null 2>&1 || true
+      kill "$launcher_pid" >/dev/null 2>&1 || true
+      wait "$launcher_pid" >/dev/null 2>&1 || true
+      append_log_details "$label" "$log"
+      rm -f "$log"
+      return 0
+    fi
+
+    if ! kill -0 "$launcher_pid" >/dev/null 2>&1; then
+      wait "$launcher_pid" >/dev/null 2>&1
+      status=$?
+      record_auto FAIL "$label" "launcher exited before IlumMac became observable (exit $status)"
+      append_log_details "$label" "$log"
+      rm -f "$log"
+      return 1
+    fi
+
+    sleep 1
+    attempts=$((attempts + 1))
+  done
+
+  kill "$launcher_pid" >/dev/null 2>&1 || true
+  wait "$launcher_pid" >/dev/null 2>&1 || true
+  record_auto FAIL "$label" "IlumMac did not become observable before the launch-smoke deadline"
+  append_log_details "$label" "$log"
+  rm -f "$log"
+  return 1
 }
 
 manual_check() {
@@ -177,7 +224,24 @@ else
 fi
 
 run_check "Local model doctor + real chat smoke" bash "$ROOT/Scripts/doctor.sh" --chat || true
-run_check "Release Ilum.app build + ad-hoc signature" bash "$ROOT/Scripts/build-app.sh" || true
+
+if [[ "$LAUNCH" -eq 1 ]]; then
+  if [[ "$HOST_OS" != "Darwin" ]]; then
+    append "- [ ] **Source launch via Scripts/run.sh** — not attempted on non-macOS host"
+  elif pgrep -x IlumMac >/dev/null 2>&1; then
+    record_auto FAIL "Clean Ilum launch state" "IlumMac is already running; close it before acceptance so launch checks cannot false-pass"
+    append "- [ ] **Source launch via Scripts/run.sh** — blocked by pre-existing IlumMac process"
+  else
+    record_auto PASS "Clean Ilum launch state" "no pre-existing IlumMac process"
+    run_source_launch_smoke || true
+  fi
+else
+  append "- [ ] **Source launch via Scripts/run.sh** — not requested by this run"
+fi
+
+if run_check "Release Ilum.app build + ad-hoc signature" bash "$ROOT/Scripts/build-app.sh"; then
+  BUILD_OK=1
+fi
 
 APP="$ROOT/dist/Ilum.app"
 if [[ -x "$APP/Contents/MacOS/IlumMac" ]]; then
@@ -196,19 +260,27 @@ else
   record_auto FAIL "Ilum.app signature verifies"
 fi
 
-if [[ "$LAUNCH" -eq 1 && "$AUTO_FAILURES" -eq 0 ]]; then
-  if open "$APP"; then
-    sleep 2
+if [[ "$LAUNCH" -eq 1 && "$HOST_OS" == "Darwin" && "$BUILD_OK" -eq 1 ]]; then
+  if pgrep -x IlumMac >/dev/null 2>&1; then
+    record_auto FAIL "Packaged app launch smoke" "IlumMac is already running before packaged launch; refusing a false-positive check"
+  elif open "$APP"; then
+    attempts=0
+    while [[ "$attempts" -lt 15 ]] && ! pgrep -x IlumMac >/dev/null 2>&1; do
+      sleep 1
+      attempts=$((attempts + 1))
+    done
     if pgrep -x IlumMac >/dev/null 2>&1; then
-      record_auto PASS "Packaged app launch smoke" "IlumMac process is running"
+      record_auto PASS "Packaged app launch smoke" "a fresh IlumMac process is running"
     else
-      record_auto FAIL "Packaged app launch smoke" "open returned success but IlumMac is not running after 2 seconds"
+      record_auto FAIL "Packaged app launch smoke" "open returned success but no fresh IlumMac process became observable"
     fi
   else
     record_auto FAIL "Packaged app launch smoke" "open failed"
   fi
 elif [[ "$LAUNCH" -eq 0 ]]; then
   append "- [ ] **Packaged app launch smoke** — not requested by this run"
+elif [[ "$BUILD_OK" -ne 1 ]]; then
+  append "- [ ] **Packaged app launch smoke** — blocked because the release bundle did not build successfully"
 fi
 
 append ""
@@ -225,13 +297,15 @@ if [[ "$AUTO_ONLY" -eq 0 ]]; then
   manual_check "Personal Memory delete" "Ask Ilum to forget that exact memory. Confirm a fresh one-shot approval is required and only that record is removed."
   manual_check "Opaque file authority" "Select a harmless UTF-8 text file. Confirm Ilum refers to it by an opaque resourceID and file.readText asks permission before content reaches the model."
   manual_check "Scoped file read + bookmark reopen" "Allow a read-only file permission for the session, confirm it stays scoped to that selected resource, relaunch Ilum, and confirm the registered file can be read again through the reopened bookmark."
-  manual_check "Pending permission survives restart" "Trigger a permission card, quit before deciding, relaunch, and confirm the same pending action returns without duplicating the user turn. Approve or deny it and confirm the paused turn continues correctly."
-  manual_check "Live permission revalidation" "On the restored permission card, confirm capability/resource/display information matches the currently registered tool/file rather than stale presentation data."
+  manual_check "Pending permission approve after restart" "Trigger a permission card, quit before deciding, relaunch, confirm the same pending action returns without duplicating the user turn, approve it, and confirm the paused turn continues exactly once."
+  manual_check "Pending permission deny after restart" "Trigger a fresh permission card, quit before deciding, relaunch, deny it, and confirm the tool action does not execute while the paused turn continues with a denial result."
+  manual_check "Live permission revalidation" "On a restored permission card, confirm capability/resource/display information matches the currently registered tool/file rather than stale serialized presentation data."
+  manual_check "Grounded evidence survives permission restart" "Use a turn that combines Knowledge evidence with a permission-gated tool, restart while permission is pending, then approve and confirm the continuation uses the original evidence/citations rather than silently reretrieving a different snapshot."
   manual_check "PDF Knowledge persistence + citations" "Add a text PDF to Knowledge, relaunch, ask a question answered by it, and confirm the expected document/page evidence and only valid [K#] citations are shown."
   manual_check "Document prompt-injection isolation" "Use a harmless test PDF containing an instruction-like sentence and confirm Ilum treats it as evidence text, not as authority or a permission bypass."
-  manual_check "Dense-to-sparse fallback" "Temporarily make the embedding endpoint unavailable, then ask a document question and confirm Ilum visibly falls back to persistent sparse/lexical retrieval instead of breaking the Knowledge flow."
+  manual_check "Dense-to-sparse fallback is visible" "Quit Ilum, launch with ILUM_OLLAMA_EMBED_URL=http://127.0.0.1:1/api/embed bash Scripts/run.sh, ask a question about the indexed PDF, and confirm the header shows 'Knowledge retrieval: sparse fallback' while sparse evidence/citations still work. Relaunch normally afterward."
   manual_check "Knowledge deletion" "Remove the selected indexed file and confirm its derived Knowledge/vector copies disappear and are not retrieved afterward."
-  manual_check "Visible model failure" "Launch with an unusable local model endpoint or stop the model service and confirm Ilum shows an explicit model-unavailable/error state instead of inventing an answer."
+  manual_check "Visible model failure" "Quit Ilum, launch with ILUM_MODEL_URL=http://127.0.0.1:1/v1/chat/completions ILUM_MODEL=acceptance-invalid bash Scripts/run.sh, send a harmless prompt, and confirm Ilum shows an explicit runtime/model error and does not append a fabricated assistant answer. Relaunch normally afterward."
 fi
 
 append ""

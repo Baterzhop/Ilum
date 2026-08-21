@@ -12,6 +12,8 @@ final class IlumAppModel: ObservableObject {
     @Published var draft = ""
     @Published var status = "Starting…"
     @Published var modelStatus = "Checking local model…"
+    @Published var knowledgeRetrievalStatus = "Knowledge retrieval: unavailable"
+    @Published var knowledgeRetrievalDetail: String?
     @Published var lastError: String?
     @Published var pendingApproval: PendingToolApproval?
     @Published var selectedFiles: [UserFileDescriptor] = []
@@ -31,6 +33,7 @@ final class IlumAppModel: ObservableObject {
     private var vectorIndex: SQLiteVectorIndex?
     private var embeddingProvider: OllamaEmbeddingProvider?
     private var knowledgeEngine: HybridKnowledgeIngestionEngine?
+    private var hybridRetriever: HybridKnowledgeRetriever?
     private var memoryStore: SQLitePersonalMemoryStore?
     private let permissionEngine = PermissionEngine(
         automaticallyAllowedCapabilities: [.readAppData]
@@ -257,6 +260,14 @@ final class IlumAppModel: ObservableObject {
                     else { broker = UnavailableUserFileAccessBroker() }
                     try configureRuntime(store: store, broker: broker)
                 }
+
+                if report.denseIndexed {
+                    knowledgeRetrievalStatus = "Knowledge retrieval: hybrid"
+                    knowledgeRetrievalDetail = nil
+                } else {
+                    knowledgeRetrievalStatus = "Knowledge retrieval: sparse fallback"
+                    knowledgeRetrievalDetail = report.denseIssue
+                }
             } catch {
                 status = "Knowledge ingestion failed"
                 lastError = String(describing: error)
@@ -325,7 +336,10 @@ final class IlumAppModel: ObservableObject {
             messages = pending.conversation.messages
             status = "Permission required"
         }
-        Task { await refreshConversationList() }
+        Task {
+            await refreshKnowledgeRetrievalStatus()
+            await refreshConversationList()
+        }
     }
 
     private func handleRuntimeError(
@@ -343,6 +357,7 @@ final class IlumAppModel: ObservableObject {
             pendingApproval = pending
             messages = pending.conversation.messages
         }
+        await refreshKnowledgeRetrievalStatus()
         await refreshConversationList()
     }
 
@@ -390,6 +405,8 @@ final class IlumAppModel: ObservableObject {
                 vectorIndex = nil
                 embeddingProvider = nil
                 isKnowledgeAvailable = false
+                knowledgeRetrievalStatus = "Knowledge retrieval: unavailable"
+                knowledgeRetrievalDetail = String(describing: error)
                 lastError = "Knowledge storage is disabled: \(error)"
             }
 
@@ -420,6 +437,8 @@ final class IlumAppModel: ObservableObject {
                 broker = UnavailableUserFileAccessBroker()
                 knowledgeEngine = nil
                 isKnowledgeAvailable = false
+                knowledgeRetrievalStatus = "Knowledge retrieval: unavailable"
+                knowledgeRetrievalDetail = String(describing: error)
                 lastError = "User-file access is disabled: \(error)"
             }
 
@@ -512,12 +531,20 @@ final class IlumAppModel: ObservableObject {
                 vectors: vectorIndex,
                 embeddings: embeddingProvider
             )
+            hybridRetriever = hybrid
+            knowledgeRetrievalStatus = "Knowledge retrieval: hybrid"
+            knowledgeRetrievalDetail = nil
             contextProvider = KnowledgeModelContextProvider(retriever: hybrid)
         } else if let knowledgeStore {
+            hybridRetriever = nil
+            knowledgeRetrievalStatus = "Knowledge retrieval: sparse"
+            knowledgeRetrievalDetail = nil
             contextProvider = KnowledgeModelContextProvider(
                 retriever: knowledgeStore
             )
         } else {
+            hybridRetriever = nil
+            knowledgeRetrievalStatus = "Knowledge retrieval: unavailable"
             contextProvider = nil
         }
 
@@ -540,6 +567,23 @@ final class IlumAppModel: ObservableObject {
             pendingExecutionStore: store
         )
         pendingApproval = nil
+    }
+
+    private func refreshKnowledgeRetrievalStatus() async {
+        if let hybridRetriever {
+            if let issue = await hybridRetriever.denseIssue() {
+                knowledgeRetrievalStatus = "Knowledge retrieval: sparse fallback"
+                knowledgeRetrievalDetail = issue
+            } else {
+                knowledgeRetrievalStatus = "Knowledge retrieval: hybrid"
+                knowledgeRetrievalDetail = nil
+            }
+        } else if isKnowledgeAvailable {
+            knowledgeRetrievalStatus = "Knowledge retrieval: sparse"
+            knowledgeRetrievalDetail = nil
+        } else {
+            knowledgeRetrievalStatus = "Knowledge retrieval: unavailable"
+        }
     }
 
     private func makeSystemPrompt() -> String {
@@ -592,6 +636,7 @@ final class IlumAppModel: ObservableObject {
         runtime = nil
         pendingApproval = nil
         knowledgeEngine = nil
+        hybridRetriever = nil
         memoryStore = nil
         modelName = nil
         conversations = []
@@ -602,6 +647,8 @@ final class IlumAppModel: ObservableObject {
         isSending = false
         status = "SAFE MODE"
         modelStatus = "Model unavailable in Safe Mode"
+        knowledgeRetrievalStatus = "Knowledge retrieval: unavailable"
+        knowledgeRetrievalDetail = nil
         lastError = "Persistent runtime is unavailable. Writes and actions are disabled. \(reason)"
     }
 }

@@ -72,6 +72,71 @@ final class PendingExecutionRecoveryTests: XCTestCase {
         XCTAssertEqual(durableConversation?.messages.map(\.role), [.user, .tool, .assistant])
     }
 
+    func testDenialAfterRestartKeepsOriginalGroundedContextAndClearsPending() async throws {
+        let databaseURL = temporaryURL("denial-runtime.sqlite3")
+        let conversationID = UUID()
+        let resourceID = UserFileResourceID(rawValue: "denial-file")
+        let originalContext = try groundedContext(text: "DENIAL_ORIGINAL_EVIDENCE")
+        let changedContext = try groundedContext(text: "DENIAL_CHANGED_EVIDENCE")
+        var pendingID: UUID?
+
+        do {
+            let store = try SQLiteConversationStore(url: databaseURL)
+            let runtime = try makeRuntime(
+                store: store,
+                model: RecoveryInitialModel(resourceID: resourceID),
+                broker: RecoveryFileBroker(resourceID: resourceID, content: "must not be read"),
+                context: originalContext
+            )
+
+            let first = try await runtime.send(
+                "Request the file, then continue if I deny it.",
+                conversationID: conversationID
+            )
+            guard case .permissionRequired(let pending) = first else {
+                return XCTFail("Expected permission request before restart")
+            }
+            pendingID = pending.id
+        }
+
+        let reopened = try SQLiteConversationStore(url: databaseURL)
+        let runtime = try makeRuntime(
+            store: reopened,
+            model: RecoveryDenialContinuationModel(
+                requiredEvidence: "DENIAL_ORIGINAL_EVIDENCE",
+                forbiddenEvidence: "DENIAL_CHANGED_EVIDENCE"
+            ),
+            broker: RecoveryFileBroker(resourceID: resourceID, content: "must not be read"),
+            context: changedContext
+        )
+
+        guard let restored = try await runtime.restorePendingPermission(conversationID: conversationID) else {
+            return XCTFail("Expected durable pending permission after restart")
+        }
+        XCTAssertEqual(restored.id, pendingID)
+
+        let outcome = try await runtime.denyPermission(pendingID: restored.id)
+        guard case .completed(let response) = outcome else {
+            return XCTFail("Expected completion after restored denial")
+        }
+
+        XCTAssertEqual(response.assistantMessage.content, "restored denial completed")
+        let toolMessages = response.conversation.messages.filter { $0.role == .tool }
+        XCTAssertEqual(toolMessages.count, 1)
+        guard let eventData = toolMessages[0].content.data(using: .utf8) else {
+            return XCTFail("Denied tool history must be valid UTF-8 JSON")
+        }
+        let event = try JSONDecoder().decode(ToolHistoryEvent.self, from: eventData)
+        XCTAssertEqual(event.status, .denied)
+        XCTAssertNil(event.data)
+        XCTAssertFalse(toolMessages[0].content.contains("must not be read"))
+
+        let pendingAfterResolution = try await reopened.loadPendingExecution(conversationID: conversationID)
+        XCTAssertNil(pendingAfterResolution)
+        let durableConversation = try await reopened.loadConversation(id: conversationID)
+        XCTAssertEqual(durableConversation?.messages.map(\.role), [.user, .tool, .assistant])
+    }
+
     func testRestoredApprovalUsesLivePermissionPresentation() async throws {
         let databaseURL = temporaryURL("live-permission.sqlite3")
         let conversationID = UUID()
@@ -290,6 +355,26 @@ private struct RecoveryContinuationModel: ModelProvider, Sendable {
     }
 }
 
+private struct RecoveryDenialContinuationModel: ModelProvider, Sendable {
+    let requiredEvidence: String
+    let forbiddenEvidence: String
+
+    func respond(to request: ModelRequest) async throws -> ModelTurn {
+        guard let context = request.groundedContext,
+              context.renderedText.contains(requiredEvidence),
+              !context.renderedText.contains(forbiddenEvidence) else {
+            throw RecoveryTestError.groundedSnapshotChanged
+        }
+        guard let toolMessage = request.messages.last(where: { $0.role == .tool }),
+              let data = toolMessage.content.data(using: .utf8),
+              let event = try? JSONDecoder().decode(ToolHistoryEvent.self, from: data),
+              event.status == .denied else {
+            throw RecoveryTestError.toolDenialMissing
+        }
+        return .final("restored denial completed")
+    }
+}
+
 private struct RecoveryFileBroker: UserFileAccessBroker, Sendable {
     let resourceID: UserFileResourceID
     let content: String
@@ -318,4 +403,5 @@ private struct RecoveryFileBroker: UserFileAccessBroker, Sendable {
 private enum RecoveryTestError: Error {
     case groundedSnapshotChanged
     case toolResultMissing
+    case toolDenialMissing
 }

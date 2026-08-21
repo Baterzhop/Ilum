@@ -49,10 +49,21 @@ struct ContentView: View {
                     .help("Durable Personal Memory is available. Writes and deletion require approval.")
             }
 
-            if !model.knowledgeDocuments.isEmpty {
-                Text("Knowledge: \(model.knowledgeDocuments.count)")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+            if model.isKnowledgeAvailable {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Knowledge: \(model.knowledgeDocuments.count)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Text(model.knowledgeRetrievalStatus)
+                        .font(.caption2)
+                        .foregroundStyle(
+                            model.knowledgeRetrievalStatus.contains("fallback")
+                                ? .orange
+                                : .secondary
+                        )
+                        .lineLimit(1)
+                        .help(model.knowledgeRetrievalDetail ?? model.knowledgeRetrievalStatus)
+                }
             }
 
             if let budget = model.lastContextBudget {

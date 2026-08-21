@@ -34,6 +34,8 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
+      - name: Validate helper scripts with macOS system Bash
+        run: /bin/bash -n Scripts/doctor.sh Scripts/run.sh Scripts/build-app.sh Scripts/acceptance.sh
       - name: Swift version
         run: swift --version
       - name: Test IlumCore
@@ -45,6 +47,8 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
+      - name: Validate acceptance runner with macOS system Bash
+        run: /bin/bash -n Scripts/acceptance.sh
       - name: Swift version
         run: swift --version
       - name: Test IlumMac support

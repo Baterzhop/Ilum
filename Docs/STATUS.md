@@ -33,12 +33,14 @@ This file separates implemented code from verified behavior and future work. A f
 | Persistent sparse retrieval | Implemented | SQLite FTS5 where available; deterministic Swift lexical fallback otherwise |
 | Dense retrieval | Implemented | optional local Ollama embeddings + persistent vector index |
 | Hybrid fusion | Implemented | Reciprocal Rank Fusion with sparse fallback |
+| Retrieval-mode visibility | Implemented | macOS header exposes hybrid, sparse fallback, sparse or unavailable mode after retrieval |
 | Context budgeting | Implemented | current turn is never silently removed |
 | Grounded citations | Implemented | `[K#]` markers validated against exact evidence snapshot |
 | Personal Memory | Implemented | dedicated SQLite store; read lookup may be local-policy allowed, writes/deletion require approval |
 | Multilingual policy | Implemented at runtime-prompt level | model capability still determines language quality |
 | First-run diagnostics | Implemented | `Scripts/doctor.sh`, optional real `--chat` smoke request |
-| CI | Implemented | Linux Core, macOS Core, macOS app test/build/package |
+| Physical acceptance runner | Implemented | records exact SHA, source + packaged launch smoke, build/signature evidence and guided physical checkpoints |
+| CI | Implemented | Linux Core, macOS Core, macOS app test/build/package; helper scripts syntax-checked with macOS system Bash |
 
 ## Verification gates
 
@@ -48,33 +50,58 @@ Automated CI must be green for the exact commit proposed for release:
 2. `IlumCore tests (macOS)`
 3. `IlumMac build + tests (macOS)`
 4. native `Ilum.app` packaging / plist / codesign verification
-5. `Ilum-macOS` artifact produced for the same head SHA
+5. helper-script syntax validation on Linux and `/bin/bash` on macOS
+6. `Ilum-macOS` artifact produced for the same head SHA
 
 CI status is intentionally not cached as a permanent claim in this document. Any commit after a green run creates a new release candidate and must pass the gates again on its exact SHA.
 
-Regression coverage includes restart-safe permission turns, preservation of the original grounded-context snapshot, live permission presentation after restore, fail-closed permission-identity mismatch, conversation-delete cascade for pending state, and fail-closed unknown future schema versions.
+Regression coverage includes:
+
+- restart-safe permission turns;
+- approval after restart with preservation of the original grounded-context snapshot;
+- denial after restart with preservation of the original grounded-context snapshot, no tool data read, durable denial history and pending-record cleanup;
+- live permission presentation after restore;
+- fail-closed permission-identity mismatch;
+- conversation-delete cascade for pending state;
+- dense retrieval failure falling back to sparse retrieval;
+- fail-closed unknown future schema versions.
 
 ## Physical acceptance still required before v1 release
 
-GitHub Actions cannot prove behavior against the user's actual locally installed model and macOS permissions. Before merging v1 to `main`, perform a physical acceptance session that verifies:
+GitHub Actions cannot prove behavior against the user's actual locally installed model and macOS permissions. Before merging v1 to `main`, run:
+
+```bash
+bash Scripts/acceptance.sh --guided
+```
+
+The physical session verifies:
 
 - `Scripts/doctor.sh --chat` succeeds against the actual local model;
-- Ilum launches as `swift run` and as the packaged `Ilum.app`;
+- Ilum launches as `swift run` through `Scripts/run.sh` and as packaged `Ilum.app`;
+- launch smoke cannot false-pass because an old `IlumMac` process is already running;
 - automatic local-model discovery selects a real chat model and not an embedding model;
 - real multilingual chat works and a language switch preserves context;
-- restart restores the active conversation and the saved conversation catalog;
+- restart restores the active conversation and saved conversation catalog;
 - New Chat creates an independent durable conversation;
-- close/relaunch while a permission card is pending restores the same pending action and continues the same grounded turn after approval;
-- `memory.remember` pauses for approval and the approved memory survives restart;
-- `memory.search` retrieves the approved memory;
+- Stop cancels a long turn without corrupting durable state;
+- restart while a permission card is pending restores the same action without duplicating the user turn;
+- restart→approve executes and continues the paused turn once;
+- restart→deny does not execute the tool and continues through a durable denial event;
+- a permission-gated Knowledge turn preserves the exact original grounded evidence across restart;
+- `memory.remember` pauses for approval and approved memory survives restart;
+- `memory.search` retrieves approved memory;
 - `memory.forget` requires approval and removes the selected record;
 - selecting a text file creates only an opaque resource ID for the model;
 - `file.readText` pauses for approval before file content reaches the model;
+- file bookmark access survives reopen;
 - PDF indexing survives restart;
 - a document question retrieves the expected page/chunk and renders only validated citations;
+- prompt-injection text in a document remains untrusted evidence;
+- dense embedding failure visibly changes the header to `Knowledge retrieval: sparse fallback` while sparse retrieval remains usable;
 - removing a selected indexed file also removes its derived Knowledge/vector copies;
-- dense embedding failure visibly degrades to sparse retrieval;
 - model-server failure is visible and never replaced by a fabricated assistant answer.
+
+See `Docs/PHYSICAL_ACCEPTANCE.md` for the exact physical procedure and safe temporary environment overrides used for embedding/model-failure tests.
 
 ## Deliberate non-claims
 
@@ -101,10 +128,10 @@ These capabilities may be added only through explicit contracts, permission poli
 Ilum v1 can move from Draft integration to `main` when:
 
 - all automated gates are green on the exact release commit;
-- physical macOS local-model acceptance is completed;
-- pending permission restart/resume behavior is demonstrated on the physical Mac;
+- an `Overall: PASS` guided physical macOS local-model acceptance report exists for that exact SHA;
+- pending permission restart→approve and restart→deny behavior is demonstrated on the physical Mac;
 - Personal Memory write/delete approval is demonstrated;
 - multi-conversation restart behavior is demonstrated;
-- PDF Knowledge + citation + deletion flow is demonstrated;
+- PDF Knowledge + citation + deletion + visible sparse-fallback flow is demonstrated;
 - no critical open security regression remains;
 - README and localized documentation match actual behavior.
