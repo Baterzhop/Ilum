@@ -363,14 +363,25 @@ public actor SQLiteConversationStore: ConversationStore, PendingExecutionStore {
     }
 
     /// Fails closed when an older Ilum binary opens a database written by a
-    /// newer schema it does not understand. This protects durable user data from
-    /// accidental downgrade writes.
+    /// newer schema it does not understand, or when the migration ledger has a
+    /// gap that makes the physical schema history ambiguous.
     static func validateAppliedMigrationVersions(_ applied: Set<Int>) throws {
-        let supported = Set(migrations.map(\.version))
+        let supportedVersions = migrations.map(\.version).sorted()
+        let supported = Set(supportedVersions)
         let unsupported = applied.subtracting(supported).sorted()
         guard unsupported.isEmpty else {
             throw SQLiteStoreError.corruptData(
                 "database uses unsupported newer schema migration(s): \(unsupported.map(String.init).joined(separator: ", "))"
+            )
+        }
+
+        let appliedVersions = applied.sorted()
+        let expectedPrefix = Array(supportedVersions.prefix(appliedVersions.count))
+        guard appliedVersions == expectedPrefix else {
+            let actual = appliedVersions.map(String.init).joined(separator: ", ")
+            let expected = expectedPrefix.map(String.init).joined(separator: ", ")
+            throw SQLiteStoreError.corruptData(
+                "database migration ledger is non-contiguous: found [\(actual)], expected prefix [\(expected)]"
             )
         }
     }

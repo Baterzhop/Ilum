@@ -9,6 +9,8 @@ public actor AgentRuntime {
     private let contextBudgetManager: ContextBudgetManager
     private let maxToolSteps: Int
     private var pendingExecutions: [UUID: PendingExecutionSnapshot] = [:]
+    private var activeConversationRuns: Set<UUID> = []
+    private var activePendingResolutions: Set<UUID> = []
 
     public private(set) var phase: RuntimePhase = .idle
     public private(set) var lastError: String?
@@ -37,6 +39,9 @@ public actor AgentRuntime {
 
         do {
             lastError = nil
+            try beginConversationRun(conversationID)
+            defer { endConversationRun(conversationID) }
+
             if hasPendingExecution(for: conversationID) {
                 throw AgentRuntimeError.pendingPermissionExists
             }
@@ -68,6 +73,9 @@ public actor AgentRuntime {
                 groundedContext: groundedContext
             )
         } catch {
+            if isConcurrencyGuardError(error) {
+                throw error
+            }
             if let runtimeError = error as? AgentRuntimeError,
                case .pendingPermissionExists = runtimeError {
                 phase = .awaitingPermission
@@ -82,11 +90,17 @@ public actor AgentRuntime {
     public func approvePermission(pendingID: UUID, duration: GrantDuration) async throws -> RuntimeOutcome {
         guard let toolRuntime else { throw AgentRuntimeError.toolsUnavailable }
         do {
+            lastError = nil
+            try beginPendingResolution(pendingID)
+            defer { endPendingResolution(pendingID) }
+
             guard let pending = try await pendingExecution(id: pendingID) else {
                 throw AgentRuntimeError.pendingPermissionNotFound
             }
+            try beginConversationRun(pending.conversationID)
+            defer { endConversationRun(pending.conversationID) }
+
             let livePermission = try await validatedPermission(for: pending)
-            lastError = nil
             _ = await toolRuntime.grant(livePermission, duration: duration)
             phase = .executingTool
 
@@ -118,6 +132,9 @@ public actor AgentRuntime {
                 )
             }
         } catch {
+            if isConcurrencyGuardError(error) {
+                throw error
+            }
             phase = .failed
             lastError = String(describing: error)
             throw error
@@ -126,10 +143,16 @@ public actor AgentRuntime {
 
     public func denyPermission(pendingID: UUID) async throws -> RuntimeOutcome {
         do {
+            lastError = nil
+            try beginPendingResolution(pendingID)
+            defer { endPendingResolution(pendingID) }
+
             guard let pending = try await pendingExecution(id: pendingID) else {
                 throw AgentRuntimeError.pendingPermissionNotFound
             }
-            lastError = nil
+            try beginConversationRun(pending.conversationID)
+            defer { endConversationRun(pending.conversationID) }
+
             let conversation = try await persistToolDenial(
                 call: pending.call,
                 request: pending.permission,
@@ -144,6 +167,9 @@ public actor AgentRuntime {
                 groundedContext: pending.groundedContext
             )
         } catch {
+            if isConcurrencyGuardError(error) {
+                throw error
+            }
             phase = .failed
             lastError = String(describing: error)
             throw error
@@ -398,6 +424,36 @@ public actor AgentRuntime {
         catch { throw AgentRuntimeError.toolArgumentsEncodingFailed }
     }
 
+    private func beginConversationRun(_ conversationID: UUID) throws {
+        guard activeConversationRuns.insert(conversationID).inserted else {
+            throw AgentRuntimeError.concurrentConversationRun(conversationID)
+        }
+    }
+
+    private func endConversationRun(_ conversationID: UUID) {
+        activeConversationRuns.remove(conversationID)
+    }
+
+    private func beginPendingResolution(_ pendingID: UUID) throws {
+        guard activePendingResolutions.insert(pendingID).inserted else {
+            throw AgentRuntimeError.pendingResolutionInProgress(pendingID)
+        }
+    }
+
+    private func endPendingResolution(_ pendingID: UUID) {
+        activePendingResolutions.remove(pendingID)
+    }
+
+    private func isConcurrencyGuardError(_ error: Error) -> Bool {
+        guard let runtimeError = error as? AgentRuntimeError else { return false }
+        switch runtimeError {
+        case .concurrentConversationRun, .pendingResolutionInProgress:
+            return true
+        default:
+            return false
+        }
+    }
+
     private func hasPendingExecution(for conversationID: UUID) -> Bool {
         pendingExecutions.values.contains { $0.conversationID == conversationID }
     }
@@ -413,6 +469,8 @@ public enum AgentRuntimeError: Error, CustomStringConvertible, Sendable {
     case emptyFinalResponse
     case pendingPermissionExists
     case pendingPermissionNotFound
+    case concurrentConversationRun(UUID)
+    case pendingResolutionInProgress(UUID)
     case toolsUnavailable
     case toolStepLimitExceeded(Int)
     case toolEventEncodingFailed
@@ -426,6 +484,8 @@ public enum AgentRuntimeError: Error, CustomStringConvertible, Sendable {
         case .emptyFinalResponse: return "Model returned an empty final response."
         case .pendingPermissionExists: return "This conversation is waiting for an explicit permission decision."
         case .pendingPermissionNotFound: return "The pending permission request no longer exists."
+        case .concurrentConversationRun(let id): return "Conversation \(id.uuidString) already has an active agent turn."
+        case .pendingResolutionInProgress(let id): return "Pending permission \(id.uuidString) is already being resolved."
         case .toolsUnavailable: return "The model requested a tool, but ToolRuntime is unavailable."
         case .toolStepLimitExceeded(let limit): return "Tool step limit exceeded (\(limit))."
         case .toolEventEncodingFailed: return "Tool event could not be encoded for durable conversation history."

@@ -2,7 +2,7 @@
 
 ## Product boundary
 
-Ilum is a local-first macOS AI runtime. The model is not the application security boundary. It can produce text or propose one typed tool call; durable state, permissions, file authority, retrieval, and side effects are controlled by code-owned runtimes.
+Ilum is a local-first macOS AI runtime. The model is not the application security boundary. It can produce text or propose one typed tool call; durable state, permissions, file authority, retrieval, concurrency, and side effects are controlled by code-owned runtimes.
 
 ## Runtime flow
 
@@ -10,6 +10,7 @@ Ilum is a local-first macOS AI runtime. The model is not the application securit
 User
   -> IlumMac
   -> AgentRuntime
+       -> acquire conversation run lease
        -> persist user turn (SQLite)
        -> retrieve immutable grounded-context snapshot
        -> ContextBudgetManager
@@ -21,9 +22,22 @@ User
             -> approved Tool only
        -> validate [K#] citations
        -> persist assistant/tool result (SQLite)
+       -> release conversation run lease
 ```
 
 A grounded-context snapshot is created once for a user turn and reused across tool/permission pauses. If a permission-gated turn is interrupted by app termination, Ilum persists that exact evidence snapshot with the pending ToolCall and resumes from it after restart instead of running retrieval again.
+
+## Runtime concurrency
+
+Swift actors are reentrant at `await`, so actor isolation alone is not a conversation-transaction boundary. `AgentRuntime` therefore owns an explicit conversation-scoped run lease.
+
+- Only one active agent turn or permission continuation may mutate a given conversation at a time.
+- A second send to the same conversation fails before it can persist another user message.
+- Different conversations may execute concurrently; Ilum does not serialize the entire runtime globally.
+- Approval/denial keeps the conversation lease across tool execution, transactional pending-record resolution, and the model continuation. Deleting the durable pending row therefore cannot open a race window for a new send before the paused turn finishes.
+- A pending permission ID also has a resolution guard so duplicate approve/deny requests cannot resolve the same transaction concurrently.
+
+`RuntimePhase` and `lastError` remain runtime-level diagnostics rather than per-conversation telemetry. Current `IlumMac` presents one interactive generation at a time; a future multi-client UI should introduce per-run observability without weakening the conversation lease.
 
 ## Trust boundaries
 
@@ -57,7 +71,7 @@ PDFKit extracts text only from already registered file resources. Knowledge chun
 - dense vectors: SQLite Float32 blobs
 - security-scoped bookmarks: local catalog under Application Support
 
-Conversation schema changes are applied by numbered migrations. Opening a database containing an unknown newer migration version fails closed instead of allowing an older binary to write into a schema it does not understand.
+Conversation schema changes are applied by numbered migrations. The migration ledger must be a valid prefix of the migrations known to the running binary. Opening a database containing an unknown newer migration version **or a non-contiguous/gapped known migration history** fails closed instead of allowing writes against an ambiguous schema state.
 
 When an approved or denied pending action is resolved, the resulting tool-history event and deletion of the pending record are committed together by the SQLite conversation store. Storage startup failure enters visible Safe Mode rather than silently replacing durable persistence with RAM.
 
@@ -69,7 +83,8 @@ A permission pause is a durable runtime state, not a transient UI modal:
 2. ToolCall + permission gate + evidence snapshot are persisted before the approval is exposed;
 3. restart restores the same pending ID and grounded evidence;
 4. the live tool recomputes the permission request before approval can execute;
-5. approval/denial resolution is persisted transactionally with the tool-history event.
+5. approval/denial resolution is persisted transactionally with the tool-history event;
+6. the conversation run lease remains held until the resumed model continuation completes or fails.
 
 Current v1 side-effect tools are local Personal Memory writes/deletion; those operations are idempotent under retry. Future external side-effect tools must add an execution/idempotency ledger before they are admitted to production authority.
 
@@ -81,7 +96,8 @@ Current baseline:
 2. optional dense embedding retrieval through an `EmbeddingProvider`,
 3. persistent exact cosine vector search,
 4. Reciprocal Rank Fusion,
-5. automatic lexical fallback when embeddings are unavailable.
+5. automatic lexical fallback when embeddings are unavailable,
+6. visible macOS retrieval state so dense failure is not silently hidden from the user.
 
 Exact vector scanning is intentionally correctness-first. An ANN/HNSW implementation can later replace the vector-index implementation without changing AgentRuntime authority or citation semantics.
 

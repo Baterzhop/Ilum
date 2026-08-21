@@ -19,9 +19,11 @@ This file separates implemented code from verified behavior and future work. A f
 | Native app packaging | Implemented | `Scripts/build-app.sh` creates `dist/Ilum.app`; signing/notarization is not yet a public-distribution claim |
 | Conversation persistence | Implemented | SQLite, survives reopen |
 | Multi-conversation UI | Implemented | durable catalog, New Chat, switching stored conversations |
+| Conversation run isolation | Implemented | one active turn/permission continuation per conversation; different conversations may run concurrently |
+| Pending resolution isolation | Implemented | duplicate concurrent approve/deny for the same pending transaction fails fast |
 | Durable permission-turn recovery | Implemented | pending ToolCall + exact grounded evidence survive restart; approval UI is restored |
 | Permission restore revalidation | Implemented | live tool recomputes permission request; stored capability/resource mismatch fails closed |
-| Versioned conversation migrations | Implemented | numbered SQLite migrations; unknown newer schema version fails closed |
+| Versioned conversation migrations | Implemented | numbered SQLite migrations; unknown newer or non-contiguous migration ledger fails closed |
 | Safe storage bootstrap | Implemented | critical conversation-store failure enters Safe Mode |
 | Local model transport | Implemented | OpenAI-compatible endpoint, explicit failures |
 | Local Ollama discovery | Implemented | deterministic chat-model selection; embedding-only models rejected |
@@ -57,6 +59,10 @@ CI status is intentionally not cached as a permanent claim in this document. Any
 
 Regression coverage includes:
 
+- user input persisted before model execution;
+- same-conversation concurrent turns fail before a second user message can persist;
+- different conversations remain independently runnable rather than being globally serialized;
+- permission continuation keeps the same-conversation run lease even after the durable pending row has been transactionally deleted;
 - restart-safe permission turns;
 - approval after restart with preservation of the original grounded-context snapshot;
 - denial after restart with preservation of the original grounded-context snapshot, no tool data read, durable denial history and pending-record cleanup;
@@ -64,7 +70,8 @@ Regression coverage includes:
 - fail-closed permission-identity mismatch;
 - conversation-delete cascade for pending state;
 - dense retrieval failure falling back to sparse retrieval;
-- fail-closed unknown future schema versions.
+- fail-closed unknown future schema versions;
+- fail-closed non-contiguous known migration history.
 
 ## Physical acceptance still required before v1 release
 
