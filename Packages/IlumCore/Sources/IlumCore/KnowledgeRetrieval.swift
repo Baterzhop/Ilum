@@ -121,13 +121,13 @@ public struct KnowledgeCitation: Equatable, Codable, Sendable {
     public let pageEnd: Int
 }
 
-public struct GroundedContextEntry: Equatable, Sendable {
+public struct GroundedContextEntry: Equatable, Codable, Sendable {
     public let citation: KnowledgeCitation
     public let score: Double
     public let text: String
 }
 
-public struct GroundedContext: Equatable, Sendable {
+public struct GroundedContext: Equatable, Codable, Sendable {
     public let entries: [GroundedContextEntry]
     public let renderedText: String
 }

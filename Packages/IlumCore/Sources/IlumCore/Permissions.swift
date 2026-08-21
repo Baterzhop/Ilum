@@ -35,7 +35,7 @@ public struct ResourceScope: Hashable, Codable, Sendable {
 
 public enum GrantDuration: String, Codable, Sendable { case once, session }
 
-public struct PermissionRequest: Identifiable, Equatable, Sendable {
+public struct PermissionRequest: Identifiable, Equatable, Codable, Sendable {
     public let id: UUID
     public let capability: ToolCapability
     public let resource: ResourceScope

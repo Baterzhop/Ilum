@@ -88,8 +88,16 @@ final class IlumAppModel: ObservableObject {
             do {
                 if let restored = try await runtime.loadConversation(id: summary.id) {
                     messages = restored.messages
-                    status = "Ready"
+                    if let pending = try await runtime.restorePendingPermission(conversationID: summary.id) {
+                        pendingApproval = pending
+                        messages = pending.conversation.messages
+                        status = "Permission required — restored"
+                    } else {
+                        pendingApproval = nil
+                        status = "Ready"
+                    }
                 } else {
+                    pendingApproval = nil
                     messages = []
                     status = "Conversation not found"
                     lastError = "The selected conversation no longer exists in local storage."
@@ -331,6 +339,10 @@ final class IlumAppModel: ObservableObject {
         if let restored = try? await runtime.loadConversation(id: conversationID) {
             messages = restored.messages
         }
+        if let pending = try? await runtime.restorePendingPermission(conversationID: conversationID) {
+            pendingApproval = pending
+            messages = pending.conversation.messages
+        }
         await refreshConversationList()
     }
 
@@ -415,12 +427,21 @@ final class IlumAppModel: ObservableObject {
 
             do {
                 try configureRuntime(store: openedStore, broker: broker)
-                if let runtime,
-                   let restored = try? await runtime.loadConversation(id: conversationID) {
-                    messages = restored.messages
+                if let runtime {
+                    if let restored = try await runtime.loadConversation(id: conversationID) {
+                        messages = restored.messages
+                    }
+                    if let pending = try await runtime.restorePendingPermission(conversationID: conversationID) {
+                        pendingApproval = pending
+                        messages = pending.conversation.messages
+                    }
                 }
                 await refreshConversationList()
-                status = fileCatalog == nil ? "Ready — file access disabled" : "Ready"
+                if pendingApproval != nil {
+                    status = "Permission required — restored"
+                } else {
+                    status = fileCatalog == nil ? "Ready — file access disabled" : "Ready"
+                }
             } catch {
                 enterSafeMode("Runtime initialization failed: \(error)")
             }
@@ -515,7 +536,8 @@ final class IlumAppModel: ObservableObject {
             store: store,
             model: provider,
             toolRuntime: tools,
-            contextProvider: contextProvider
+            contextProvider: contextProvider,
+            pendingExecutionStore: store
         )
         pendingApproval = nil
     }

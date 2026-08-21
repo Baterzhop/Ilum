@@ -108,7 +108,7 @@ public extension Tool {
     func metadata(for input: Input, output: Output) -> [String: JSONValue] { [:] }
 }
 
-public struct ToolCall: Identifiable, Equatable, Sendable {
+public struct ToolCall: Identifiable, Equatable, Codable, Sendable {
     public let id: UUID
     public let providerCallID: String
     public let name: String
