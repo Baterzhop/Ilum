@@ -16,14 +16,17 @@ This file separates implemented code from verified behavior and future work. A f
 | --- | --- | --- |
 | Swift 6 core | Implemented | `Packages/IlumCore` |
 | Native macOS app | Implemented | SwiftUI executable in `Apps/IlumMac` |
-| Native app packaging | Implemented | `Scripts/build-app.sh` creates `dist/Ilum.app`; signing/notarization is not yet a release claim |
+| Native app packaging | Implemented | `Scripts/build-app.sh` creates `dist/Ilum.app`; signing/notarization is not yet a public-distribution claim |
 | Conversation persistence | Implemented | SQLite, survives reopen |
 | Multi-conversation UI | Implemented | durable catalog, New Chat, switching stored conversations |
+| Durable permission-turn recovery | Implemented | pending ToolCall + exact grounded evidence survive restart; approval UI is restored |
+| Permission restore revalidation | Implemented | live tool recomputes permission request; stored capability/resource mismatch fails closed |
+| Versioned conversation migrations | Implemented | numbered SQLite migrations; unknown newer schema version fails closed |
 | Safe storage bootstrap | Implemented | critical conversation-store failure enters Safe Mode |
 | Local model transport | Implemented | OpenAI-compatible endpoint, explicit failures |
 | Local Ollama discovery | Implemented | deterministic chat-model selection; embedding-only models rejected |
 | Tool protocol/runtime | Implemented | typed registry and structured results |
-| Permission engine | Implemented | exact capability/resource grants; one-time/session grants |
+| Permission engine | Implemented | exact capability/resource grants; session grants limited to read-only capabilities |
 | User-file boundary | Implemented | security-scoped selection + opaque resource IDs |
 | PDF text ingestion | Implemented | PDFKit; scanned/image-only PDFs are not falsely treated as extracted text |
 | Knowledge store | Implemented | SQLite document/chunk provenance + explicit deletion |
@@ -39,14 +42,17 @@ This file separates implemented code from verified behavior and future work. A f
 
 ## Verification gates
 
-Automated CI must stay green for every release candidate:
+Automated CI must be green for the exact commit proposed for release:
 
 1. `IlumCore tests (Linux)`
 2. `IlumCore tests (macOS)`
 3. `IlumMac build + tests (macOS)`
-4. native `Ilum.app` packaging / plist validation
+4. native `Ilum.app` packaging / plist / codesign verification
+5. `Ilum-macOS` artifact produced for the same head SHA
 
-An earlier runtime/app foundation passed the three build/test gates. The exact current integration head must pass again after Personal Memory, model discovery, multi-conversation support, FTS5, Knowledge deletion and packaging changes. Until that exact run is green, these newer additions are implemented but not release-verified.
+CI status is intentionally not cached as a permanent claim in this document. Any commit after a green run creates a new release candidate and must pass the gates again on its exact SHA.
+
+Regression coverage includes restart-safe permission turns, preservation of the original grounded-context snapshot, live permission presentation after restore, fail-closed permission-identity mismatch, conversation-delete cascade for pending state, and fail-closed unknown future schema versions.
 
 ## Physical acceptance still required before v1 release
 
@@ -58,6 +64,7 @@ GitHub Actions cannot prove behavior against the user's actual locally installed
 - real multilingual chat works and a language switch preserves context;
 - restart restores the active conversation and the saved conversation catalog;
 - New Chat creates an independent durable conversation;
+- close/relaunch while a permission card is pending restores the same pending action and continues the same grounded turn after approval;
 - `memory.remember` pauses for approval and the approved memory survives restart;
 - `memory.search` retrieves the approved memory;
 - `memory.forget` requires approval and removes the selected record;
@@ -85,6 +92,8 @@ The following are not yet v1 release claims:
 - no cloud sync dependency;
 - no signed/notarized public macOS distribution yet.
 
+Future external side-effect tools also require a durable execution/idempotency ledger before production use. Current v1 permission-gated writes are local Personal Memory operations with retry-safe semantics.
+
 These capabilities may be added only through explicit contracts, permission policy, regression tests, and an acceptance gate. Direct self-modification from arbitrary model output remains prohibited.
 
 ## Definition of v1 release
@@ -93,6 +102,7 @@ Ilum v1 can move from Draft integration to `main` when:
 
 - all automated gates are green on the exact release commit;
 - physical macOS local-model acceptance is completed;
+- pending permission restart/resume behavior is demonstrated on the physical Mac;
 - Personal Memory write/delete approval is demonstrated;
 - multi-conversation restart behavior is demonstrated;
 - PDF Knowledge + citation + deletion flow is demonstrated;

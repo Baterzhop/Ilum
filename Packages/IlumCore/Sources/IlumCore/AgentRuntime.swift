@@ -85,8 +85,9 @@ public actor AgentRuntime {
             guard let pending = try await pendingExecution(id: pendingID) else {
                 throw AgentRuntimeError.pendingPermissionNotFound
             }
+            let livePermission = try await validatedPermission(for: pending)
             lastError = nil
-            _ = await toolRuntime.grant(pending.permission, duration: duration)
+            _ = await toolRuntime.grant(livePermission, duration: duration)
             phase = .executingTool
 
             switch try await toolRuntime.execute(pending.call) {
@@ -165,19 +166,23 @@ public actor AgentRuntime {
 
     /// Restores a permission-gated tool turn from durable storage without
     /// re-running retrieval or asking the model to reproduce the tool call.
+    /// The user-facing permission request is recomputed from the live registered
+    /// tool and stored ToolCall. Serialized permission text is never authority.
     public func restorePendingPermission(conversationID: UUID) async throws -> PendingToolApproval? {
         if let existing = pendingExecutions.values.first(where: { $0.conversationID == conversationID }) {
+            let livePermission = try await validatedPermission(for: existing)
             phase = .awaitingPermission
-            return existing.approval
+            return approval(for: existing, permission: livePermission)
         }
         guard let pendingStore,
               let snapshot = try await pendingStore.loadPendingExecution(conversationID: conversationID) else {
             return nil
         }
         try validate(snapshot)
+        let livePermission = try await validatedPermission(for: snapshot)
         pendingExecutions[snapshot.id] = snapshot
         phase = .awaitingPermission
-        return snapshot.approval
+        return approval(for: snapshot, permission: livePermission)
     }
 
     private func continueRun(
@@ -272,7 +277,7 @@ public actor AgentRuntime {
         }
         pendingExecutions[pendingID] = snapshot
         phase = .awaitingPermission
-        return .permissionRequired(snapshot.approval)
+        return .permissionRequired(approval(for: snapshot, permission: request))
     }
 
     private func pendingExecution(id: UUID) async throws -> PendingExecutionSnapshot? {
@@ -296,6 +301,32 @@ public actor AgentRuntime {
         guard snapshot.completedToolSteps >= 0, snapshot.completedToolSteps < maxToolSteps else {
             throw AgentRuntimeError.invalidPendingExecution("tool-step counter is outside the runtime limit")
         }
+    }
+
+    private func validatedPermission(for snapshot: PendingExecutionSnapshot) async throws -> PermissionRequest {
+        guard let toolRuntime else { throw AgentRuntimeError.toolsUnavailable }
+        let live = try await toolRuntime.permissionRequest(for: snapshot.call)
+        guard live.capability == snapshot.permission.capability,
+              live.resource == snapshot.permission.resource else {
+            throw AgentRuntimeError.invalidPendingExecution(
+                "stored permission identity does not match the live tool call"
+            )
+        }
+        return live
+    }
+
+    private func approval(
+        for snapshot: PendingExecutionSnapshot,
+        permission: PermissionRequest
+    ) -> PendingToolApproval {
+        PendingToolApproval(
+            id: snapshot.id,
+            conversation: snapshot.conversation,
+            permission: permission,
+            toolName: snapshot.call.name,
+            toolVersion: snapshot.call.version,
+            createdAt: snapshot.createdAt
+        )
     }
 
     private func persistToolSuccess(

@@ -344,6 +344,7 @@ public actor SQLiteConversationStore: ConversationStore, PendingExecutionStore {
             sql: "CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at REAL NOT NULL);"
         )
         var applied = try appliedMigrationVersions(db)
+        try validateAppliedMigrationVersions(applied)
         for migration in migrations where !applied.contains(migration.version) {
             try execute(db, sql: "BEGIN IMMEDIATE TRANSACTION;")
             do {
@@ -358,6 +359,19 @@ public actor SQLiteConversationStore: ConversationStore, PendingExecutionStore {
                 try? execute(db, sql: "ROLLBACK;")
                 throw error
             }
+        }
+    }
+
+    /// Fails closed when an older Ilum binary opens a database written by a
+    /// newer schema it does not understand. This protects durable user data from
+    /// accidental downgrade writes.
+    static func validateAppliedMigrationVersions(_ applied: Set<Int>) throws {
+        let supported = Set(migrations.map(\.version))
+        let unsupported = applied.subtracting(supported).sorted()
+        guard unsupported.isEmpty else {
+            throw SQLiteStoreError.corruptData(
+                "database uses unsupported newer schema migration(s): \(unsupported.map(String.init).joined(separator: ", "))"
+            )
         }
     }
 

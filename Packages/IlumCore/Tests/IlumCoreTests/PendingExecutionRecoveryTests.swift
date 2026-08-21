@@ -72,6 +72,107 @@ final class PendingExecutionRecoveryTests: XCTestCase {
         XCTAssertEqual(durableConversation?.messages.map(\.role), [.user, .tool, .assistant])
     }
 
+    func testRestoredApprovalUsesLivePermissionPresentation() async throws {
+        let databaseURL = temporaryURL("live-permission.sqlite3")
+        let conversationID = UUID()
+        let resourceID = UserFileResourceID(rawValue: "live-file")
+        let store = try SQLiteConversationStore(url: databaseURL)
+        let conversation = Conversation(
+            id: conversationID,
+            title: "Live permission",
+            messages: [ChatMessage(role: .user, content: "Read it")]
+        )
+        try await store.saveConversation(conversation)
+
+        let call = try ToolCall.encoding(
+            name: "file.readText",
+            version: "2",
+            input: ReadTextFileInput(resourceID: resourceID)
+        )
+        let serializedPresentation = PermissionRequest(
+            capability: .readUserFile,
+            resource: .userFile(resourceID),
+            reason: "FORGED SERIALIZED REASON",
+            resourceDisplayName: "forged.txt",
+            resourceLocationHint: "/forged/path"
+        )
+        let snapshot = PendingExecutionSnapshot(
+            id: UUID(),
+            conversationID: conversationID,
+            conversation: conversation,
+            call: call,
+            permission: serializedPresentation,
+            completedToolSteps: 0,
+            groundedContext: nil
+        )
+        try await store.savePendingExecution(snapshot)
+
+        let runtime = try makeRuntime(
+            store: store,
+            model: RecoveryInitialModel(resourceID: resourceID),
+            broker: RecoveryFileBroker(resourceID: resourceID, content: "content"),
+            context: try groundedContext(text: "evidence")
+        )
+        let restored = try await runtime.restorePendingPermission(conversationID: conversationID)
+
+        XCTAssertEqual(restored?.permission.reason, ReadTextFileTool.descriptor.summary)
+        XCTAssertEqual(restored?.permission.resourceDisplayName, "restart.txt")
+        XCTAssertEqual(restored?.permission.resourceLocationHint, "/user-selected/restart.txt")
+        XCTAssertNotEqual(restored?.permission.id, serializedPresentation.id)
+    }
+
+    func testTamperedPendingPermissionResourceFailsClosed() async throws {
+        let databaseURL = temporaryURL("tamper.sqlite3")
+        let conversationID = UUID()
+        let resourceID = UserFileResourceID(rawValue: "real-file")
+        let store = try SQLiteConversationStore(url: databaseURL)
+        let conversation = Conversation(
+            id: conversationID,
+            title: "Tamper test",
+            messages: [ChatMessage(role: .user, content: "Read it")]
+        )
+        try await store.saveConversation(conversation)
+
+        let call = try ToolCall.encoding(
+            name: "file.readText",
+            version: "2",
+            input: ReadTextFileInput(resourceID: resourceID)
+        )
+        let mismatchedPermission = PermissionRequest(
+            capability: .readUserFile,
+            resource: .userFile(UserFileResourceID(rawValue: "different-file")),
+            reason: "mismatched authority"
+        )
+        try await store.savePendingExecution(
+            PendingExecutionSnapshot(
+                id: UUID(),
+                conversationID: conversationID,
+                conversation: conversation,
+                call: call,
+                permission: mismatchedPermission,
+                completedToolSteps: 0,
+                groundedContext: nil
+            )
+        )
+
+        let runtime = try makeRuntime(
+            store: store,
+            model: RecoveryInitialModel(resourceID: resourceID),
+            broker: RecoveryFileBroker(resourceID: resourceID, content: "content"),
+            context: try groundedContext(text: "evidence")
+        )
+
+        do {
+            _ = try await runtime.restorePendingPermission(conversationID: conversationID)
+            XCTFail("Mismatched durable permission identity must fail closed")
+        } catch let error as AgentRuntimeError {
+            guard case .invalidPendingExecution(let detail) = error else {
+                return XCTFail("Unexpected runtime error: \(error)")
+            }
+            XCTAssertTrue(detail.contains("permission identity"))
+        }
+    }
+
     func testConversationDeletionCascadesPendingExecution() async throws {
         let databaseURL = temporaryURL("cascade.sqlite3")
         let conversationID = UUID()
@@ -96,6 +197,22 @@ final class PendingExecutionRecoveryTests: XCTestCase {
         let pendingAfterDelete = try await store.loadPendingExecution(conversationID: conversationID)
         XCTAssertNil(conversationAfterDelete)
         XCTAssertNil(pendingAfterDelete)
+    }
+
+    func testUnknownFutureMigrationVersionFailsClosed() throws {
+        XCTAssertNoThrow(
+            try SQLiteConversationStore.validateAppliedMigrationVersions([1, 2])
+        )
+        XCTAssertThrowsError(
+            try SQLiteConversationStore.validateAppliedMigrationVersions([1, 2, 999])
+        ) { error in
+            guard let storeError = error as? SQLiteStoreError,
+                  case .corruptData(let detail) = storeError else {
+                return XCTFail("Unexpected migration error: \(error)")
+            }
+            XCTAssertTrue(detail.contains("unsupported newer schema"))
+            XCTAssertTrue(detail.contains("999"))
+        }
     }
 
     private func makeRuntime(

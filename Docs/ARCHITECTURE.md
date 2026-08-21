@@ -23,7 +23,7 @@ User
        -> persist assistant/tool result (SQLite)
 ```
 
-A grounded-context snapshot is created once for a user turn and reused across tool/permission pauses. Retrieval therefore cannot silently change evidence midway through the same run.
+A grounded-context snapshot is created once for a user turn and reused across tool/permission pauses. If a permission-gated turn is interrupted by app termination, Ilum persists that exact evidence snapshot with the pending ToolCall and resumes from it after restart instead of running retrieval again.
 
 ## Trust boundaries
 
@@ -35,9 +35,11 @@ Untrusted decision component. It has no direct file handle, SQLite connection, p
 
 The only execution route for model-proposed actions. Unknown tool name/version fails closed. Tool input is decoded against typed Codable models and advertised JSON schemas.
 
+For a restored pending action, `ToolRuntime` recomputes the permission request from the currently registered tool and the persisted ToolCall. Serialized permission reason/display text is not treated as authority. The restored action fails closed if the persisted capability/resource identity does not match the live tool request.
+
 ### PermissionEngine
 
-Grants are scoped by capability + exact resource and by duration (`once` or `session`). Chat prose cannot create a grant. A one-time grant is consumed by authorization.
+Grants are scoped by capability + exact resource and by duration (`once` or `session`). Chat prose cannot create a grant. A one-time grant is consumed by authorization. Session grants are limited to read-only capabilities; writes and other side effects require a fresh one-shot decision.
 
 ### User files
 
@@ -50,11 +52,26 @@ PDFKit extracts text only from already registered file resources. Knowledge chun
 ## Persistence
 
 - conversations/messages: SQLite + WAL
+- permission-gated pending agent turns: versioned SQLite snapshots containing the ToolCall, an audit copy of the permission request, completed tool-step count, conversation state and exact grounded-context snapshot
 - Knowledge documents/chunks: SQLite + WAL
 - dense vectors: SQLite Float32 blobs
 - security-scoped bookmarks: local catalog under Application Support
 
-Storage startup failure enters visible Safe Mode rather than silently replacing durable persistence with RAM.
+Conversation schema changes are applied by numbered migrations. Opening a database containing an unknown newer migration version fails closed instead of allowing an older binary to write into a schema it does not understand.
+
+When an approved or denied pending action is resolved, the resulting tool-history event and deletion of the pending record are committed together by the SQLite conversation store. Storage startup failure enters visible Safe Mode rather than silently replacing durable persistence with RAM.
+
+## Crash/restart semantics
+
+A permission pause is a durable runtime state, not a transient UI modal:
+
+1. user input is persisted before model/tool work;
+2. ToolCall + permission gate + evidence snapshot are persisted before the approval is exposed;
+3. restart restores the same pending ID and grounded evidence;
+4. the live tool recomputes the permission request before approval can execute;
+5. approval/denial resolution is persisted transactionally with the tool-history event.
+
+Current v1 side-effect tools are local Personal Memory writes/deletion; those operations are idempotent under retry. Future external side-effect tools must add an execution/idempotency ledger before they are admitted to production authority.
 
 ## Retrieval
 
@@ -81,7 +98,7 @@ Evidence is labeled `[K1]`, `[K2]`, etc. The answer is scanned after generation.
 Ilum v1 does not enable:
 
 - shell execution
-- file deletion
+- file deletion by the model
 - unrestricted directory access
 - arbitrary HTTP/network action tools
 - automatic code modification / SelfCoder

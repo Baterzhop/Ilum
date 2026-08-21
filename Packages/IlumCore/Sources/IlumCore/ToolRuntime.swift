@@ -222,14 +222,26 @@ public actor ToolRuntime {
     private let permissions: PermissionEngine
     public init(registry: ToolRegistry, permissions: PermissionEngine) { self.registry = registry; self.permissions = permissions }
     public func descriptors() -> [ToolDescriptor] { registry.descriptors }
+
+    /// Resolves the permission request from the currently registered tool and the
+    /// concrete call arguments without authorizing or executing the tool. Durable
+    /// pending state uses this after restart so serialized UI text is never treated
+    /// as permission authority.
+    public func permissionRequest(for call: ToolCall) throws -> PermissionRequest {
+        guard let tool = registry.resolve(name: call.name, version: call.version) else {
+            throw ToolRuntimeError.unknownTool(name: call.name, version: call.version)
+        }
+        return try tool.permissionRequest(arguments: call.arguments)
+    }
+
     @discardableResult public func grant(_ request: PermissionRequest, duration: GrantDuration) async -> PermissionGrant {
         await permissions.grant(request, duration: duration)
     }
     public func execute(_ call: ToolCall) async throws -> ToolExecutionOutcome {
+        let request = try permissionRequest(for: call)
         guard let tool = registry.resolve(name: call.name, version: call.version) else {
             throw ToolRuntimeError.unknownTool(name: call.name, version: call.version)
         }
-        let request = try tool.permissionRequest(arguments: call.arguments)
         guard await permissions.authorize(request) else { return .permissionRequired(request) }
         let result = try await tool.execute(arguments: call.arguments)
         return .success(ToolExecutionSuccess(callID: call.id, descriptor: tool.descriptor, data: result.data, warnings: result.warnings, metadata: result.metadata))
