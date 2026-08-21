@@ -20,7 +20,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Validate helper scripts
-        run: bash -n Scripts/doctor.sh Scripts/run.sh Scripts/build-app.sh
+        run: bash -n Scripts/doctor.sh Scripts/run.sh Scripts/build-app.sh Scripts/acceptance.sh
       - name: Install SQLite headers
         run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
       - name: Swift version
