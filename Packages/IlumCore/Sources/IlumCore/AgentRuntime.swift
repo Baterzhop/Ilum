@@ -1,0 +1,501 @@
+import Foundation
+
+public actor AgentRuntime {
+    private let store: any ConversationStore
+    private let model: any ModelProvider
+    private let toolRuntime: ToolRuntime?
+    private let contextProvider: (any ModelContextProvider)?
+    private let pendingStore: (any PendingExecutionStore)?
+    private let contextBudgetManager: ContextBudgetManager
+    private let maxToolSteps: Int
+    private var pendingExecutions: [UUID: PendingExecutionSnapshot] = [:]
+    private var activeConversationRuns: Set<UUID> = []
+    private var activePendingResolutions: Set<UUID> = []
+
+    public private(set) var phase: RuntimePhase = .idle
+    public private(set) var lastError: String?
+
+    public init(
+        store: any ConversationStore,
+        model: any ModelProvider,
+        toolRuntime: ToolRuntime? = nil,
+        contextProvider: (any ModelContextProvider)? = nil,
+        pendingExecutionStore: (any PendingExecutionStore)? = nil,
+        contextBudgetManager: ContextBudgetManager = ContextBudgetManager(),
+        maxToolSteps: Int = 8
+    ) {
+        self.store = store
+        self.model = model
+        self.toolRuntime = toolRuntime
+        self.contextProvider = contextProvider
+        self.pendingStore = pendingExecutionStore
+        self.contextBudgetManager = contextBudgetManager
+        self.maxToolSteps = max(1, maxToolSteps)
+    }
+
+    public func send(_ text: String, conversationID: UUID, title: String = "New conversation") async throws -> RuntimeOutcome {
+        let normalized = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty else { throw AgentRuntimeError.emptyInput }
+
+        do {
+            lastError = nil
+            try beginConversationRun(conversationID)
+            defer { endConversationRun(conversationID) }
+
+            if hasPendingExecution(for: conversationID) {
+                throw AgentRuntimeError.pendingPermissionExists
+            }
+            if try await restorePendingPermission(conversationID: conversationID) != nil {
+                throw AgentRuntimeError.pendingPermissionExists
+            }
+
+            phase = .loadingConversation
+            var conversation = try await store.loadConversation(id: conversationID) ?? Conversation(id: conversationID, title: title)
+            if conversation.messages.isEmpty, conversation.title == "New conversation" {
+                conversation.title = Self.makeTitle(from: normalized)
+            }
+            conversation.messages.append(ChatMessage(role: .user, content: normalized))
+            conversation.updatedAt = Date()
+            phase = .persistingUserMessage
+            try await store.saveConversation(conversation)
+
+            let groundedContext: GroundedContext?
+            if let contextProvider {
+                phase = .retrievingKnowledge
+                groundedContext = try await contextProvider.context(for: normalized)
+            } else {
+                groundedContext = nil
+            }
+            return try await continueRun(
+                conversation: conversation,
+                conversationID: conversationID,
+                completedToolSteps: 0,
+                groundedContext: groundedContext
+            )
+        } catch {
+            if isConcurrencyGuardError(error) {
+                throw error
+            }
+            if let runtimeError = error as? AgentRuntimeError,
+               case .pendingPermissionExists = runtimeError {
+                phase = .awaitingPermission
+            } else {
+                phase = .failed
+            }
+            lastError = String(describing: error)
+            throw error
+        }
+    }
+
+    public func approvePermission(pendingID: UUID, duration: GrantDuration) async throws -> RuntimeOutcome {
+        guard let toolRuntime else { throw AgentRuntimeError.toolsUnavailable }
+        do {
+            lastError = nil
+            try beginPendingResolution(pendingID)
+            defer { endPendingResolution(pendingID) }
+
+            guard let pending = try await pendingExecution(id: pendingID) else {
+                throw AgentRuntimeError.pendingPermissionNotFound
+            }
+            try beginConversationRun(pending.conversationID)
+            defer { endConversationRun(pending.conversationID) }
+
+            let livePermission = try await validatedPermission(for: pending)
+            _ = await toolRuntime.grant(
+                livePermission,
+                duration: duration,
+                callID: pending.call.id
+            )
+            phase = .executingTool
+
+            switch try await toolRuntime.execute(pending.call) {
+            case .permissionRequired(let changedRequest):
+                return try await suspendForPermission(
+                    conversation: pending.conversation,
+                    conversationID: pending.conversationID,
+                    call: pending.call,
+                    request: changedRequest,
+                    completedToolSteps: pending.completedToolSteps,
+                    groundedContext: pending.groundedContext,
+                    pendingID: pending.id,
+                    createdAt: pending.createdAt
+                )
+            case .success(let success):
+                let conversation = try await persistToolSuccess(
+                    success,
+                    call: pending.call,
+                    in: pending.conversation,
+                    resolvingPendingID: pending.id
+                )
+                pendingExecutions.removeValue(forKey: pending.id)
+                return try await continueRun(
+                    conversation: conversation,
+                    conversationID: pending.conversationID,
+                    completedToolSteps: pending.completedToolSteps + 1,
+                    groundedContext: pending.groundedContext
+                )
+            }
+        } catch {
+            if isConcurrencyGuardError(error) {
+                throw error
+            }
+            phase = .failed
+            lastError = String(describing: error)
+            throw error
+        }
+    }
+
+    public func denyPermission(pendingID: UUID) async throws -> RuntimeOutcome {
+        do {
+            lastError = nil
+            try beginPendingResolution(pendingID)
+            defer { endPendingResolution(pendingID) }
+
+            guard let pending = try await pendingExecution(id: pendingID) else {
+                throw AgentRuntimeError.pendingPermissionNotFound
+            }
+            try beginConversationRun(pending.conversationID)
+            defer { endConversationRun(pending.conversationID) }
+
+            let conversation = try await persistToolDenial(
+                call: pending.call,
+                request: pending.permission,
+                in: pending.conversation,
+                resolvingPendingID: pending.id
+            )
+            pendingExecutions.removeValue(forKey: pending.id)
+            return try await continueRun(
+                conversation: conversation,
+                conversationID: pending.conversationID,
+                completedToolSteps: pending.completedToolSteps + 1,
+                groundedContext: pending.groundedContext
+            )
+        } catch {
+            if isConcurrencyGuardError(error) {
+                throw error
+            }
+            phase = .failed
+            lastError = String(describing: error)
+            throw error
+        }
+    }
+
+    public func loadConversation(id: UUID) async throws -> Conversation? {
+        phase = .loadingConversation
+        do {
+            let conversation = try await store.loadConversation(id: id)
+            _ = try await restorePendingPermission(conversationID: id)
+            if !hasPendingExecution(for: id) { phase = .idle }
+            return conversation
+        } catch {
+            phase = .failed
+            lastError = String(describing: error)
+            throw error
+        }
+    }
+
+    /// Restores a permission-gated tool turn from durable storage without
+    /// re-running retrieval or asking the model to reproduce the tool call.
+    /// The user-facing permission request is recomputed from the live registered
+    /// tool and stored ToolCall. Serialized permission text is never authority.
+    public func restorePendingPermission(conversationID: UUID) async throws -> PendingToolApproval? {
+        if let existing = pendingExecutions.values.first(where: { $0.conversationID == conversationID }) {
+            let livePermission = try await validatedPermission(for: existing)
+            phase = .awaitingPermission
+            return approval(for: existing, permission: livePermission)
+        }
+        guard let pendingStore,
+              let snapshot = try await pendingStore.loadPendingExecution(conversationID: conversationID) else {
+            return nil
+        }
+        try validate(snapshot)
+        let livePermission = try await validatedPermission(for: snapshot)
+        pendingExecutions[snapshot.id] = snapshot
+        phase = .awaitingPermission
+        return approval(for: snapshot, permission: livePermission)
+    }
+
+    private func continueRun(
+        conversation: Conversation,
+        conversationID: UUID,
+        completedToolSteps: Int,
+        groundedContext: GroundedContext?
+    ) async throws -> RuntimeOutcome {
+        phase = .waitingForModel
+        let tools: [ToolDescriptor]
+        if let toolRuntime { tools = await toolRuntime.descriptors() } else { tools = [] }
+        let pack = contextBudgetManager.pack(messages: conversation.messages, groundedContext: groundedContext)
+        guard pack.report.fits else { throw AgentRuntimeError.contextBudgetExceeded }
+        let turn = try await model.respond(
+            to: ModelRequest(
+                messages: pack.messages,
+                availableTools: tools,
+                groundedContext: pack.groundedContext
+            )
+        )
+
+        switch turn {
+        case .final(let content):
+            let normalized = content.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !normalized.isEmpty else { throw AgentRuntimeError.emptyFinalResponse }
+            let citations = try GroundedCitationResolver().resolve(in: normalized, context: groundedContext)
+            var updated = conversation
+            let assistantMessage = ChatMessage(role: .assistant, content: normalized)
+            updated.messages.append(assistantMessage)
+            updated.updatedAt = Date()
+            phase = .persistingAssistantMessage
+            try await store.saveConversation(updated)
+            phase = .idle
+            return .completed(
+                RuntimeResponse(
+                    conversation: updated,
+                    assistantMessage: assistantMessage,
+                    citations: citations,
+                    contextBudget: pack.report
+                )
+            )
+        case .toolCall(let call):
+            guard completedToolSteps < maxToolSteps else {
+                throw AgentRuntimeError.toolStepLimitExceeded(maxToolSteps)
+            }
+            guard let toolRuntime else { throw AgentRuntimeError.toolsUnavailable }
+            phase = .executingTool
+            switch try await toolRuntime.execute(call) {
+            case .permissionRequired(let request):
+                return try await suspendForPermission(
+                    conversation: conversation,
+                    conversationID: conversationID,
+                    call: call,
+                    request: request,
+                    completedToolSteps: completedToolSteps,
+                    groundedContext: groundedContext
+                )
+            case .success(let success):
+                let updated = try await persistToolSuccess(success, call: call, in: conversation)
+                return try await continueRun(
+                    conversation: updated,
+                    conversationID: conversationID,
+                    completedToolSteps: completedToolSteps + 1,
+                    groundedContext: groundedContext
+                )
+            }
+        }
+    }
+
+    private func suspendForPermission(
+        conversation: Conversation,
+        conversationID: UUID,
+        call: ToolCall,
+        request: PermissionRequest,
+        completedToolSteps: Int,
+        groundedContext: GroundedContext?,
+        pendingID: UUID = UUID(),
+        createdAt: Date = Date()
+    ) async throws -> RuntimeOutcome {
+        let snapshot = PendingExecutionSnapshot(
+            id: pendingID,
+            conversationID: conversationID,
+            conversation: conversation,
+            call: call,
+            permission: request,
+            completedToolSteps: completedToolSteps,
+            groundedContext: groundedContext,
+            createdAt: createdAt
+        )
+        if let pendingStore {
+            try await pendingStore.savePendingExecution(snapshot)
+        }
+        pendingExecutions[pendingID] = snapshot
+        phase = .awaitingPermission
+        return .permissionRequired(approval(for: snapshot, permission: request))
+    }
+
+    private func pendingExecution(id: UUID) async throws -> PendingExecutionSnapshot? {
+        if let pending = pendingExecutions[id] { return pending }
+        guard let pendingStore,
+              let snapshot = try await pendingStore.loadPendingExecution(id: id) else {
+            return nil
+        }
+        try validate(snapshot)
+        pendingExecutions[snapshot.id] = snapshot
+        return snapshot
+    }
+
+    private func validate(_ snapshot: PendingExecutionSnapshot) throws {
+        guard snapshot.formatVersion == PendingExecutionSnapshot.currentFormatVersion else {
+            throw AgentRuntimeError.invalidPendingExecution("unsupported format \(snapshot.formatVersion)")
+        }
+        guard snapshot.conversationID == snapshot.conversation.id else {
+            throw AgentRuntimeError.invalidPendingExecution("conversation identity mismatch")
+        }
+        guard snapshot.completedToolSteps >= 0, snapshot.completedToolSteps < maxToolSteps else {
+            throw AgentRuntimeError.invalidPendingExecution("tool-step counter is outside the runtime limit")
+        }
+    }
+
+    private func validatedPermission(for snapshot: PendingExecutionSnapshot) async throws -> PermissionRequest {
+        guard let toolRuntime else { throw AgentRuntimeError.toolsUnavailable }
+        let live = try await toolRuntime.permissionRequest(for: snapshot.call)
+        guard live.capability == snapshot.permission.capability,
+              live.resource == snapshot.permission.resource else {
+            throw AgentRuntimeError.invalidPendingExecution(
+                "stored permission identity does not match the live tool call"
+            )
+        }
+        return live
+    }
+
+    private func approval(
+        for snapshot: PendingExecutionSnapshot,
+        permission: PermissionRequest
+    ) -> PendingToolApproval {
+        PendingToolApproval(
+            id: snapshot.id,
+            conversation: snapshot.conversation,
+            permission: permission,
+            toolName: snapshot.call.name,
+            toolVersion: snapshot.call.version,
+            createdAt: snapshot.createdAt
+        )
+    }
+
+    private func persistToolSuccess(
+        _ success: ToolExecutionSuccess,
+        call: ToolCall,
+        in conversation: Conversation,
+        resolvingPendingID: UUID? = nil
+    ) async throws -> Conversation {
+        let event = ToolHistoryEvent(
+            status: .success,
+            callID: call.id,
+            providerCallID: call.providerCallID,
+            tool: success.descriptor.name,
+            version: success.descriptor.version,
+            arguments: try decodeToolArguments(call.arguments),
+            data: success.data,
+            warnings: success.warnings,
+            metadata: success.metadata,
+            detail: nil
+        )
+        return try await appendToolEvent(event, to: conversation, resolvingPendingID: resolvingPendingID)
+    }
+
+    private func persistToolDenial(
+        call: ToolCall,
+        request: PermissionRequest,
+        in conversation: Conversation,
+        resolvingPendingID: UUID? = nil
+    ) async throws -> Conversation {
+        let event = ToolHistoryEvent(
+            status: .denied,
+            callID: call.id,
+            providerCallID: call.providerCallID,
+            tool: call.name,
+            version: call.version,
+            arguments: try decodeToolArguments(call.arguments),
+            detail: "User denied \(request.capability.rawValue) for \(request.resource.identifier)."
+        )
+        return try await appendToolEvent(event, to: conversation, resolvingPendingID: resolvingPendingID)
+    }
+
+    private func appendToolEvent(
+        _ event: ToolHistoryEvent,
+        to conversation: Conversation,
+        resolvingPendingID: UUID? = nil
+    ) async throws -> Conversation {
+        let data = try JSONEncoder().encode(event)
+        guard let content = String(data: data, encoding: .utf8) else {
+            throw AgentRuntimeError.toolEventEncodingFailed
+        }
+        var updated = conversation
+        updated.messages.append(ChatMessage(role: .tool, content: content))
+        updated.updatedAt = Date()
+        phase = .persistingToolResult
+
+        if let resolvingPendingID, let pendingStore {
+            try await pendingStore.resolvePendingExecution(
+                id: resolvingPendingID,
+                conversation: updated
+            )
+        } else {
+            try await store.saveConversation(updated)
+        }
+        return updated
+    }
+
+    private func decodeToolArguments(_ data: Data) throws -> JSONValue {
+        do { return try JSONDecoder().decode(JSONValue.self, from: data) }
+        catch { throw AgentRuntimeError.toolArgumentsEncodingFailed }
+    }
+
+    private func beginConversationRun(_ conversationID: UUID) throws {
+        guard activeConversationRuns.insert(conversationID).inserted else {
+            throw AgentRuntimeError.concurrentConversationRun(conversationID)
+        }
+    }
+
+    private func endConversationRun(_ conversationID: UUID) {
+        activeConversationRuns.remove(conversationID)
+    }
+
+    private func beginPendingResolution(_ pendingID: UUID) throws {
+        guard activePendingResolutions.insert(pendingID).inserted else {
+            throw AgentRuntimeError.pendingResolutionInProgress(pendingID)
+        }
+    }
+
+    private func endPendingResolution(_ pendingID: UUID) {
+        activePendingResolutions.remove(pendingID)
+    }
+
+    private func isConcurrencyGuardError(_ error: Error) -> Bool {
+        guard let runtimeError = error as? AgentRuntimeError else { return false }
+        switch runtimeError {
+        case .concurrentConversationRun, .pendingResolutionInProgress:
+            return true
+        default:
+            return false
+        }
+    }
+
+    private func hasPendingExecution(for conversationID: UUID) -> Bool {
+        pendingExecutions.values.contains { $0.conversationID == conversationID }
+    }
+
+    private static func makeTitle(from text: String) -> String {
+        let singleLine = text.replacingOccurrences(of: "\n", with: " ")
+        return singleLine.count <= 48 ? singleLine : String(singleLine.prefix(45)) + "…"
+    }
+}
+
+public enum AgentRuntimeError: Error, CustomStringConvertible, Sendable {
+    case emptyInput
+    case emptyFinalResponse
+    case pendingPermissionExists
+    case pendingPermissionNotFound
+    case concurrentConversationRun(UUID)
+    case pendingResolutionInProgress(UUID)
+    case toolsUnavailable
+    case toolStepLimitExceeded(Int)
+    case toolEventEncodingFailed
+    case toolArgumentsEncodingFailed
+    case contextBudgetExceeded
+    case invalidPendingExecution(String)
+
+    public var description: String {
+        switch self {
+        case .emptyInput: return "Message cannot be empty."
+        case .emptyFinalResponse: return "Model returned an empty final response."
+        case .pendingPermissionExists: return "This conversation is waiting for an explicit permission decision."
+        case .pendingPermissionNotFound: return "The pending permission request no longer exists."
+        case .concurrentConversationRun(let id): return "Conversation \(id.uuidString) already has an active agent turn."
+        case .pendingResolutionInProgress(let id): return "Pending permission \(id.uuidString) is already being resolved."
+        case .toolsUnavailable: return "The model requested a tool, but ToolRuntime is unavailable."
+        case .toolStepLimitExceeded(let limit): return "Tool step limit exceeded (\(limit))."
+        case .toolEventEncodingFailed: return "Tool event could not be encoded for durable conversation history."
+        case .toolArgumentsEncodingFailed: return "Tool arguments could not be encoded for durable protocol history."
+        case .contextBudgetExceeded: return "The current turn cannot fit safely in the configured model context window."
+        case .invalidPendingExecution(let detail): return "Durable pending execution is invalid: \(detail)."
+        }
+    }
+}
