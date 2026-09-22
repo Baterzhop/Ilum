@@ -230,7 +230,8 @@ public actor AgentRuntime {
             to: ModelRequest(
                 messages: pack.messages,
                 availableTools: tools,
-                groundedContext: pack.groundedContext
+                groundedContext: pack.groundedContext,
+                maxOutputTokens: contextBudgetManager.policy.reservedOutputTokens
             )
         )
 

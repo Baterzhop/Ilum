@@ -15,31 +15,71 @@ public struct HybridRetrievalPolicy: Codable, Hashable, Sendable {
     }
 }
 
+public enum HybridRetrievalMode: String, Sendable {
+    case hybrid
+    case sparse
+    case sparseFallback
+}
+
 public actor HybridKnowledgeRetriever: KnowledgeRetriever {
     private let sparse: any KnowledgeRetriever
     private let vectors: any DenseVectorIndex
     private let embeddings: any EmbeddingProvider
     private let policy: HybridRetrievalPolicy
     private var lastDenseIssue: String?
+    private var lastMode: HybridRetrievalMode = .sparse
+    private let clock = ContinuousClock()
+    private let denseFailureCooldown: Duration
+    private var denseRetryAfter: ContinuousClock.Instant?
 
-    public init(sparse: any KnowledgeRetriever, vectors: any DenseVectorIndex, embeddings: any EmbeddingProvider, policy: HybridRetrievalPolicy = HybridRetrievalPolicy()) {
+    public init(sparse: any KnowledgeRetriever, vectors: any DenseVectorIndex, embeddings: any EmbeddingProvider, policy: HybridRetrievalPolicy = HybridRetrievalPolicy(), denseFailureCooldown: Duration = .seconds(30)) {
         self.sparse = sparse; self.vectors = vectors; self.embeddings = embeddings; self.policy = policy
+        self.denseFailureCooldown = max(.zero, denseFailureCooldown)
     }
 
     public func search(_ query: String, maxHits: Int) async throws -> [KnowledgeHit] {
         guard (1...50).contains(maxHits) else { throw KnowledgeRetrievalError.invalidMaxHits }
+        try Task.checkCancellation()
         async let sparseTask = sparse.search(query, maxHits: policy.sparseCandidates)
         var denseHits: [KnowledgeHit] = []
         do {
-            guard let queryVector = try await embeddings.embed([query]).first else { throw EmbeddingError.emptyEmbedding }
-            denseHits = try await vectors.search(vector: queryVector, modelID: embeddings.modelID, limit: policy.denseCandidates)
-            lastDenseIssue = nil
-        } catch { lastDenseIssue = String(describing: error) }
+            let hasVectors: Bool
+            if let availability = vectors as? any DenseVectorAvailability {
+                hasVectors = try await availability.hasVectors(modelID: embeddings.modelID)
+            } else {
+                // Preserve adapters without an existence-check capability.
+                hasVectors = true
+            }
+            try Task.checkCancellation()
+            if !hasVectors {
+                lastMode = .sparse
+                lastDenseIssue = nil
+                denseRetryAfter = nil
+            } else if let retryAfter = denseRetryAfter, clock.now < retryAfter {
+                lastMode = .sparseFallback
+            } else {
+                guard let queryVector = try await embeddings.embed([query]).first else { throw EmbeddingError.emptyEmbedding }
+                try Task.checkCancellation()
+                denseHits = try await vectors.search(vector: queryVector, modelID: embeddings.modelID, limit: policy.denseCandidates)
+                lastMode = .hybrid
+                lastDenseIssue = nil
+                denseRetryAfter = nil
+            }
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            try Task.checkCancellation()
+            lastMode = .sparseFallback
+            lastDenseIssue = String(describing: error)
+            denseRetryAfter = clock.now.advanced(by: denseFailureCooldown)
+        }
         let sparseHits = try await sparseTask
+        try Task.checkCancellation()
         return Self.reciprocalRankFusion(sparse: sparseHits, dense: denseHits, limit: maxHits, policy: policy)
     }
 
     public func denseIssue() -> String? { lastDenseIssue }
+    public func retrievalMode() -> HybridRetrievalMode { lastMode }
 
     public static func reciprocalRankFusion(sparse: [KnowledgeHit], dense: [KnowledgeHit], limit: Int, policy: HybridRetrievalPolicy = HybridRetrievalPolicy()) -> [KnowledgeHit] {
         guard limit > 0 else { return [] }

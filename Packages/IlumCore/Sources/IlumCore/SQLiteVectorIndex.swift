@@ -7,7 +7,7 @@ private final class VectorSQLiteConnection: @unchecked Sendable {
     deinit { sqlite3_close_v2(raw) }
 }
 
-public actor SQLiteVectorIndex: DenseVectorIndex {
+public actor SQLiteVectorIndex: DenseVectorIndex, DenseVectorAvailability {
     public let databaseURL: URL
     private var connection: VectorSQLiteConnection?
 
@@ -33,6 +33,18 @@ public actor SQLiteVectorIndex: DenseVectorIndex {
 
     public func removeDocument(id: UUID) async throws {
         try deleteDocument(id, db: try openIfNeeded())
+    }
+
+    public func hasVectors(modelID: String) async throws -> Bool {
+        let db = try openIfNeeded()
+        let statement = try prepare("SELECT 1 FROM knowledge_vectors WHERE model_id = ?1 LIMIT 1;", db: db)
+        defer { sqlite3_finalize(statement) }
+        try bind(modelID, index: 1, statement: statement, db: db)
+        switch sqlite3_step(statement) {
+        case SQLITE_ROW: return true
+        case SQLITE_DONE: return false
+        default: throw VectorIndexError.statementFailed(message(db))
+        }
     }
 
     public func search(vector: [Float], modelID: String, limit: Int) async throws -> [KnowledgeHit] {

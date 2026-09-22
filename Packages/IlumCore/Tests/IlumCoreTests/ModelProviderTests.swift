@@ -6,6 +6,65 @@ import XCTest
 @testable import IlumCore
 
 final class ModelProviderTests: XCTestCase {
+    func testRuntimeSendsTheReservedOutputBudgetToTheRealWirePayload() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("ilum-output-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let transport = CapturingHTTPTransport(
+            response: """
+            {"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":"short answer"}}]}
+            """
+        )
+        let runtime = AgentRuntime(
+            store: try SQLiteConversationStore(url: root.appendingPathComponent("chat.sqlite3")),
+            model: OpenAICompatibleProvider(model: "test-model", transport: transport),
+            contextBudgetManager: ContextBudgetManager(policy: ContextBudgetPolicy(reservedOutputTokens: 256))
+        )
+        _ = try await runtime.send("hello", conversationID: UUID())
+        let captured = await transport.lastRequest()
+        let body = try XCTUnwrap(captured?.httpBody)
+        let payload = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
+        XCTAssertEqual(payload["max_tokens"] as? Int, 256)
+    }
+
+    func testLengthTruncatedAnswerIsNotPersistedAsComplete() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("ilum-truncated-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try SQLiteConversationStore(url: root.appendingPathComponent("chat.sqlite3"))
+        let transport = CapturingHTTPTransport(
+            response: """
+            {"choices":[{"finish_reason":"length","message":{"role":"assistant","content":"unfinished"}}]}
+            """
+        )
+        let runtime = AgentRuntime(store: store, model: OpenAICompatibleProvider(model: "test-model", transport: transport))
+        let id = UUID()
+        do {
+            _ = try await runtime.send("a longer question", conversationID: id)
+            XCTFail("A truncated response must be reported explicitly")
+        } catch let error as ModelProviderError {
+            guard case .outputLimitReached = error else { return XCTFail("Unexpected error: \(error)") }
+        }
+        let conversation = try await store.loadConversation(id: id)
+        XCTAssertEqual(conversation?.messages.map(\.role), [.user])
+    }
+
+    func testLengthTruncatedToolCallIsRejectedBeforeExecution() async throws {
+        let descriptor = ReadTextFileTool.descriptor
+        let transport = CapturingHTTPTransport(
+            response: """
+            {"choices":[{"finish_reason":"length","message":{"role":"assistant","content":null,"tool_calls":[{"id":"call-cut","type":"function","function":{"name":"\(descriptor.wireName)","arguments":"{}"}}]}}]}
+            """
+        )
+        let provider = OpenAICompatibleProvider(model: "test-model", transport: transport)
+        do {
+            _ = try await provider.respond(to: ModelRequest(
+                messages: [ChatMessage(role: .user, content: "read it")], availableTools: [descriptor]
+            ))
+            XCTFail("A truncated tool call must never be returned to ToolRuntime")
+        } catch let error as ModelProviderError {
+            guard case .outputLimitReached = error else { return XCTFail("Unexpected error: \(error)") }
+        }
+    }
+
     func testOpenAICompatibleProviderReturnsFinalText() async throws {
         let transport = CapturingHTTPTransport(
             response: """
