@@ -525,11 +525,18 @@ final class IlumAppModel: ObservableObject {
         )
 
         let contextProvider: (any ModelContextProvider)?
-        if let knowledgeStore, let vectorIndex, let embeddingProvider {
+        if knowledgeStore != nil && knowledgeDocuments.isEmpty {
+            hybridRetriever = nil
+            knowledgeRetrievalStatus = "Knowledge retrieval: no documents"
+            knowledgeRetrievalDetail = nil
+            contextProvider = nil
+        } else if let knowledgeStore, let vectorIndex, embeddingProvider != nil {
             let hybrid = HybridKnowledgeRetriever(
                 sparse: knowledgeStore,
                 vectors: vectorIndex,
-                embeddings: embeddingProvider
+                // Interactive search must not inherit the longer ingestion
+                // timeout. Keep 60 seconds for batched document indexing.
+                embeddings: OllamaEmbeddingProvider(timeout: 3)
             )
             hybridRetriever = hybrid
             knowledgeRetrievalStatus = "Knowledge retrieval: hybrid"
@@ -571,13 +578,20 @@ final class IlumAppModel: ObservableObject {
 
     private func refreshKnowledgeRetrievalStatus() async {
         if let hybridRetriever {
-            if let issue = await hybridRetriever.denseIssue() {
+            switch await hybridRetriever.retrievalMode() {
+            case .sparseFallback:
                 knowledgeRetrievalStatus = "Knowledge retrieval: sparse fallback"
-                knowledgeRetrievalDetail = issue
-            } else {
+                knowledgeRetrievalDetail = await hybridRetriever.denseIssue()
+            case .hybrid:
                 knowledgeRetrievalStatus = "Knowledge retrieval: hybrid"
                 knowledgeRetrievalDetail = nil
+            case .sparse:
+                knowledgeRetrievalStatus = "Knowledge retrieval: sparse"
+                knowledgeRetrievalDetail = nil
             }
+        } else if isKnowledgeAvailable && knowledgeDocuments.isEmpty {
+            knowledgeRetrievalStatus = "Knowledge retrieval: no documents"
+            knowledgeRetrievalDetail = nil
         } else if isKnowledgeAvailable {
             knowledgeRetrievalStatus = "Knowledge retrieval: sparse"
             knowledgeRetrievalDetail = nil

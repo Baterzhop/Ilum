@@ -107,11 +107,17 @@ Current baseline:
 5. automatic lexical fallback when embeddings are unavailable,
 6. visible macOS retrieval state so dense failure is not silently hidden from the user.
 
+The macOS client skips retrieval when Knowledge has no documents. `SQLiteVectorIndex` exposes an optional, model-specific existence check so hybrid retrieval can skip the embedding endpoint when that model has no indexed vectors. A lack of sparse matches alone does not skip semantic search.
+
+Interactive query embeddings use a 3-second request timeout, independent from the 60-second ingestion timeout. A failed dense search opens a 30-second cooldown; subsequent searches retain sparse results without immediately retrying the failed endpoint. Cancellation propagates rather than becoming a fallback success. UI diagnostics distinguish sparse-only retrieval from dense-error fallback.
+
 Exact vector scanning is intentionally correctness-first. An ANN/HNSW implementation can later replace the vector-index implementation without changing AgentRuntime authority or citation semantics.
 
 ## Context management
 
-`ContextBudgetManager` reserves output and safety space, accounts for grounded evidence, and packs the newest usable history into the remaining model window. The newest turn is never silently discarded. An oversized unsafe request fails explicitly.
+`ContextBudgetManager` reserves output and safety space, accounts for grounded evidence, and packs the newest usable history into the remaining model window. The reserved output amount is forwarded as the model request's `max_tokens`. A provider-reported length truncation is an explicit error before final-answer persistence or tool-call execution.
+
+The current estimator uses a fixed system allowance and packs individual messages. Accounting for the complete serialized prompt/tool schemas and preserving whole user/tool turns during history compaction remain follow-up work. An oversized selected context fails explicitly.
 
 ## Citations
 

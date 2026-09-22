@@ -7,9 +7,11 @@ public struct ModelRequest: Sendable {
     public let messages: [ChatMessage]
     public let availableTools: [ToolDescriptor]
     public let groundedContext: GroundedContext?
+    public let maxOutputTokens: Int
 
-    public init(messages: [ChatMessage], availableTools: [ToolDescriptor] = [], groundedContext: GroundedContext? = nil) {
+    public init(messages: [ChatMessage], availableTools: [ToolDescriptor] = [], groundedContext: GroundedContext? = nil, maxOutputTokens: Int = 1_024) {
         self.messages = messages; self.availableTools = availableTools; self.groundedContext = groundedContext
+        self.maxOutputTokens = max(1, maxOutputTokens)
     }
 }
 
@@ -42,6 +44,7 @@ public enum ModelProviderError: Error, CustomStringConvertible, Sendable {
     case malformedToolArguments(tool: String)
     case multipleToolCallsUnsupported(Int)
     case invalidToolHistory
+    case outputLimitReached
 
     public var description: String {
         switch self {
@@ -53,6 +56,7 @@ public enum ModelProviderError: Error, CustomStringConvertible, Sendable {
         case .malformedToolArguments(let tool): return "Model returned malformed JSON arguments for \(tool)."
         case .multipleToolCallsUnsupported(let count): return "Model returned \(count) tool calls in one turn; Ilum permits one deterministic tool call per turn."
         case .invalidToolHistory: return "Stored tool history is invalid and cannot be sent to the model safely."
+        case .outputLimitReached: return "The model reached the response token limit before finishing. Ask for a shorter answer or increase ILUM_OUTPUT_TOKENS."
         }
     }
 }
@@ -80,7 +84,7 @@ public struct OpenAICompatibleProvider: ModelProvider, Sendable {
         try Self.validateWireNames(request.availableTools)
         let apiMessages = try makeAPIMessages(from: request.messages, availableTools: request.availableTools, groundedContext: request.groundedContext)
         let tools = request.availableTools.isEmpty ? nil : request.availableTools.map(Self.makeToolDefinition)
-        let payload = RequestBody(model: model, messages: apiMessages, stream: false, tools: tools)
+        let payload = RequestBody(model: model, messages: apiMessages, stream: false, tools: tools, maxTokens: request.maxOutputTokens)
 
         var urlRequest = URLRequest(url: endpoint)
         urlRequest.httpMethod = "POST"
@@ -95,7 +99,11 @@ public struct OpenAICompatibleProvider: ModelProvider, Sendable {
         let decoded: ResponseBody
         do { decoded = try JSONDecoder().decode(ResponseBody.self, from: response.data) }
         catch { throw ModelProviderError.invalidResponse }
-        guard let message = decoded.choices.first?.message else { throw ModelProviderError.invalidResponse }
+        guard let choice = decoded.choices.first else { throw ModelProviderError.invalidResponse }
+        // A length-truncated tool call must never become an executable action;
+        // a truncated answer must not be persisted as a completed response.
+        guard choice.finishReason != "length" else { throw ModelProviderError.outputLimitReached }
+        let message = choice.message
 
         if let calls = message.toolCalls, !calls.isEmpty {
             guard calls.count == 1 else { throw ModelProviderError.multipleToolCallsUnsupported(calls.count) }
@@ -173,9 +181,20 @@ public struct OpenAICompatibleProvider: ModelProvider, Sendable {
     }
 }
 
-private struct RequestBody: Encodable { let model: String; let messages: [APIRequestMessage]; let stream: Bool; let tools: [APIToolDefinition]? }
+private struct RequestBody: Encodable {
+    let model: String
+    let messages: [APIRequestMessage]
+    let stream: Bool
+    let tools: [APIToolDefinition]?
+    let maxTokens: Int
+    enum CodingKeys: String, CodingKey { case model, messages, stream, tools; case maxTokens = "max_tokens" }
+}
 private struct ResponseBody: Decodable { let choices: [Choice] }
-private struct Choice: Decodable { let message: APIResponseMessage }
+private struct Choice: Decodable {
+    let message: APIResponseMessage
+    let finishReason: String?
+    enum CodingKeys: String, CodingKey { case message; case finishReason = "finish_reason" }
+}
 
 private struct APIRequestMessage: Encodable {
     let role: String

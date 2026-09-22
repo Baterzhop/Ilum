@@ -104,7 +104,9 @@ export ILUM_OLLAMA_EMBED_URL="http://127.0.0.1:11434/api/embed"
 export ILUM_EMBED_MODEL="nomic-embed-text"
 ```
 
-If dense embeddings become unavailable during search, Knowledge continues through sparse retrieval and the UI visibly reports sparse fallback. If the chat model is unavailable, Ilum reports the failure instead of silently inventing an answer.
+If dense embeddings become unavailable during search, Knowledge continues through sparse retrieval and the UI visibly reports sparse fallback. Interactive embedding requests use a 3-second request timeout; after a dense-search failure, subsequent searches use sparse retrieval for a 30-second cooldown before trying dense again. Document indexing retains its longer 60-second request timeout. A timeout is not a guarantee of total end-to-end response time.
+
+An empty Knowledge library does not run retrieval. When the vector index has no entries for the configured embedding model, search stays sparse without requesting an embedding. Adding or removing indexed vectors is recognized without restarting the app. If the chat model is unavailable, Ilum reports the failure instead of silently inventing an answer.
 
 ## Context controls
 
@@ -114,7 +116,17 @@ export ILUM_OUTPUT_TOKENS=1024
 export ILUM_CONTEXT_SAFETY_TOKENS=512
 ```
 
-The current user/tool turn is never silently removed. If a request cannot fit safely, the runtime fails explicitly.
+`ILUM_OUTPUT_TOKENS` reserves output space in the context budget and is also sent to the OpenAI-compatible server as `max_tokens`. If the provider reports `finish_reason: length`, Ilum reports the limit explicitly instead of saving a partial answer as complete or executing a truncated tool call. Provider behavior, including whether reasoning tokens consume this limit, should be checked against the installed model server.
+
+If a request cannot fit the current context budget, the runtime fails explicitly.
+
+### Performance work
+
+Development is focused on Ilum. LumiOrigin remains historical reference material for selective feature migration, especially spreadsheet tools; it is not a second active implementation line.
+
+The first latency change removes unnecessary embedding calls, adds dense-failure cooldown, and enforces the reserved output budget in the model request. Streaming, explicit Ollama thinking profiles, full-request context accounting, and incremental chat persistence remain separate follow-up work. These changes do not claim a measured speedup on the target Mac.
+
+For a physical check, compare the same short question with (1) no indexed documents, (2) an indexed text PDF, and (3) an unavailable embedding endpoint. Repeat the third case immediately to check sparse cooldown. Confirm citations still refer to the indexed document, Stop still cancels a generation, and an intentionally small output budget reports truncation explicitly. Record the exact build, Mac/RAM, Ollama/model version, cold versus warm start, and complete response time. CI mocks verify request counts and protocol behavior; they do not benchmark the installed LLM.
 
 ## Release discipline
 

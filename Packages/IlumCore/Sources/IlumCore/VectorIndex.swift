@@ -17,6 +17,12 @@ public protocol DenseVectorIndex: Sendable {
     func search(vector: [Float], modelID: String, limit: Int) async throws -> [KnowledgeHit]
 }
 
+/// Optional read-only capability. A model-specific existence check avoids an
+/// embedding request when there is nothing that model could search.
+public protocol DenseVectorAvailability: Sendable {
+    func hasVectors(modelID: String) async throws -> Bool
+}
+
 public enum VectorIndexError: Error, CustomStringConvertible, Sendable {
     case emptyVector
     case dimensionMismatch
