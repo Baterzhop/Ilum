@@ -138,3 +138,12 @@ On a build containing native Ollama streaming, use the default endpoint or expli
 - A completed authorized tool action remains in history if its following generation is cancelled. Stop does not undo that action.
 - Interrupt Ollama mid-stream and test a small output limit: show an explicit error, retain the user turn, and do not save a partial assistant answer or execute a partial tool call.
 - Restart with pending approval, then approve/deny: the original action/context must resume once. Check citations only appear as trusted sources after the final answer validates.
+
+## Model choice and measured performance
+
+- Install at least two chat/tool-capable models outside Ilum. Refresh models, select each, and verify the displayed model actually changes and the preference survives restart. Compare the same prompt in fresh chats, both first and repeat requests.
+- Confirm explicit `ILUM_MODEL` overrides the saved choice. Remove that environment setting before testing the picker. Removing a saved model must show an automatic fallback, not a stale selection.
+- During generation, indexing and a pending permission decision, model switching/refresh must be disabled. Model changes must not bypass or discard pending authorization.
+- Expand/copy the performance report. Check that elapsed, first text, load, prompt and generation times are plausible for the observed request. Server values can be absent; absent values must not display as zero.
+- Cancel a request and interrupt Ollama. Reports must say Cancelled/Failed. Repeat with a tool continuation and verify the new timing excludes time spent waiting for the permission decision.
+- Compare useful answer quality and successful tool calls alongside speed. A smaller file is not proof that the model is suitable for every task.

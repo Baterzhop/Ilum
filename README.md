@@ -93,7 +93,9 @@ bash Scripts/build-app.sh
 open dist/Ilum.app
 ```
 
-When `ILUM_MODEL` is not set, Ilum inspects the local Ollama catalog and deterministically selects a chat-capable model. Embedding/reranker models are excluded from chat selection. No model is downloaded automatically.
+When `ILUM_MODEL` is not set, Ilum inspects the local Ollama catalog. A saved selection for that endpoint wins; otherwise it starts with the smallest positive known model file size, with name preferences used only as tie-breakers. Unknown/zero sizes rank after known sizes. The picker and automatic selection require Ollama `/api/show` to advertise both `completion` and `tools`; missing/unavailable metadata is not guessed from the name. Metadata requests run only on discovery/refresh, at most three at once. Explicit `ILUM_MODEL` remains an override. Size is a resource-use heuristic, not a guarantee of speed or answer quality. No model is downloaded automatically.
+
+Use **Model** in the composer to choose an installed model and **Refresh models** after installing/removing one in Ollama. The selection survives restart and is scoped to the endpoint. If a saved model disappears, Ilum visibly falls back to the automatic choice. Selection and refresh are disabled during generation, indexing, or pending permission. `ILUM_MODEL` takes precedence and locks the picker; unset it to use the UI. Custom non-Ollama endpoints keep explicit configuration.
 
 ### Explicit model configuration
 
@@ -129,6 +131,10 @@ Ilum skips unnecessary embedding calls, applies a dense-failure cooldown, and en
 The default endpoint is `/api/chat`. An explicitly configured OpenAI-compatible `/v1/chat/completions` endpoint retains buffered responses and has no thinking selector. Change an old Ollama `ILUM_MODEL_URL` export to `/api/chat` (or remove it) to enable the new behavior. `doctor.sh --chat` checks the native Fast request by default, using a buffered smoke response; it does not measure UI streaming or read the app's saved mode.
 
 The UI shows the saved user message immediately, current activity, elapsed seconds, and a temporary answer preview. Stop cancels the network generation, including generation after approve/deny. Already completed authorized tool actions are retained. A partial, cancelled, malformed, or length-truncated answer never becomes a completed chat entry; tool calls require a complete valid stream before permission/execution. The source bar appears only after citation validation.
+
+Expand the performance summary below the response controls to inspect elapsed time, time to first visible text, and per-call model loading, prompt processing, token generation, and tokens/second when Ollama supplies them. **Copy performance report** copies these measurements plus OS/RAM information, without prompt or document text. The total covers one send or approve/deny operation; waiting for permission is excluded, and first visible text can be a tool preamble. Multiple calls use total generated tokens divided by total generation time, not an average of rates. Missing measurements remain unavailable. Failed/cancelled operations retain that status, and incomplete calls do not invent final server statistics. OpenAI-compatible responses report client elapsed time only.
+
+For an A/B comparison, open a new chat for each model, send the same short prompt, and save the reports for the first and second request. Compare answer quality and tool behavior as well as time. `doctor.sh` follows the smaller-model automatic policy but does not read the UI's saved selection; set `ILUM_MODEL` to test the same model explicitly.
 
 Full-request context accounting and incremental chat persistence remain follow-up work. These changes do not claim a measured speedup on the target Mac.
 

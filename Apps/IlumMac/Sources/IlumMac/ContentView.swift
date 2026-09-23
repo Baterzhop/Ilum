@@ -301,6 +301,24 @@ struct ContentView: View {
 
     private var composer: some View {
         VStack(alignment: .leading, spacing: 8) {
+            if model.usesOllamaCatalog && !model.modelSelectionLocked {
+                HStack {
+                    Picker("Model", selection: Binding(
+                        get: { model.modelName ?? "" }, set: { model.selectModel($0) }
+                    )) {
+                        if model.modelName == nil { Text("No model available").tag("") }
+                        ForEach(model.availableChatModels, id: \.name) { descriptor in
+                            Text(model.modelLabel(descriptor)).tag(descriptor.name)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    .help("Installed models reporting chat and tool support. Sizes are model files, not RAM requirements. Smaller models may use fewer resources, with different answer quality. No model is downloaded automatically.")
+                    Button { model.refreshModels() } label: {
+                        Label("Refresh models", systemImage: "arrow.clockwise")
+                    }
+                }
+                .disabled(model.isSending || model.pendingApproval != nil || model.isSafeMode || model.indexingResourceID != nil)
+            }
             HStack {
                 if model.supportsThinkingControl {
                     Picker("Response mode", selection: Binding(
@@ -322,6 +340,22 @@ struct ContentView: View {
                             .font(.caption.monospacedDigit())
                             .foregroundStyle(.secondary)
                     }
+                }
+            }
+            if let performance = model.lastPerformance, !model.isSending {
+                DisclosureGroup {
+                    VStack(alignment: .leading, spacing: 8) {
+                        ScrollView {
+                            Text(performance.report)
+                                .font(.caption.monospaced())
+                                .textSelection(.enabled)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        .frame(maxHeight: 220)
+                        Button("Copy performance report") { model.copyPerformanceReport() }
+                    }
+                } label: {
+                    Text(performance.summary).font(.caption).foregroundStyle(.secondary)
                 }
             }
             if let error = model.lastError {

@@ -55,12 +55,13 @@ public struct OllamaChatProvider: ModelProvider, Sendable {
         urlRequest.timeoutInterval = 120
         urlRequest.httpBody = try JSONEncoder().encode(body)
 
+        let started = ContinuousClock.now
         let connection = transport.open(urlRequest)
         defer { connection.cancel() }
         var status: Int?
         var errorBody = Data()
         var lines = NDJSONLines()
-        var accumulator = OllamaAccumulator()
+        var accumulator = OllamaAccumulator(started: started)
         var totalBytes = 0
         do {
             for try await event in connection.events {
@@ -125,6 +126,8 @@ private struct OllamaAccumulator {
     var thinking = ""
     var calls: [OllamaToolCall] = []
     var reportedThinking = false
+    let started: ContinuousClock.Instant
+    var firstTextSeconds: Double?
 
     mutating func consume(_ line: Data, request: ModelRequest, onProgress: ModelProgressHandler) async throws -> ModelTurn? {
         if line.allSatisfy({ $0 == 0x0D || $0 == 0x20 || $0 == 0x09 }) { return nil }
@@ -141,6 +144,7 @@ private struct OllamaAccumulator {
             }
             if let delta = message.content, !delta.isEmpty {
                 content += delta
+                if firstTextSeconds == nil { firstTextSeconds = started.duration(to: .now).ilumSeconds }
                 await onProgress(.textDelta(delta))
             }
             calls.append(contentsOf: message.toolCalls ?? [])
@@ -149,6 +153,7 @@ private struct OllamaAccumulator {
         guard done else { return nil }
         guard chunk.doneReason != "length" else { throw ModelProviderError.outputLimitReached }
         guard chunk.doneReason == nil || chunk.doneReason == "stop" else { throw ModelProviderError.invalidResponse }
+        let turn: ModelTurn
         if let call = calls.first {
             guard call.function.index == nil || call.function.index == 0 else { throw ModelProviderError.invalidResponse }
             guard let descriptor = request.availableTools.first(where: { $0.wireName == call.function.name }) else {
@@ -157,15 +162,23 @@ private struct OllamaAccumulator {
             guard case .object = call.function.arguments else {
                 throw ModelProviderError.malformedToolArguments(tool: descriptor.registryKey)
             }
-            return .toolCall(ToolCall(
+            turn = .toolCall(ToolCall(
                 name: descriptor.name, version: descriptor.version,
                 arguments: try JSONEncoder().encode(call.function.arguments),
                 assistantContext: ToolAssistantContext(content: content, thinking: thinking)
             ))
+        } else {
+            let answer = content.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !answer.isEmpty else { throw ModelProviderError.emptyResponse }
+            turn = .final(answer)
         }
-        let answer = content.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !answer.isEmpty else { throw ModelProviderError.emptyResponse }
-        return .final(answer)
+        try Task.checkCancellation()
+        let elapsed = started.duration(to: .now).ilumSeconds
+        let server = try? JSONDecoder().decode(OllamaResponseMetrics.self, from: line)
+        let metrics = server?.measured(requestSeconds: elapsed, firstTextSeconds: firstTextSeconds)
+            ?? ModelResponseMetrics(requestSeconds: elapsed, firstTextSeconds: firstTextSeconds)
+        await onProgress(.metrics(metrics))
+        return turn
     }
 }
 

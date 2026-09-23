@@ -43,7 +43,14 @@ final class IlumAppModel: ObservableObject {
         automaticallyAllowedCapabilities: [.readAppData]
     )
     private var modelEndpoint = URL(string: "http://127.0.0.1:11434/api/chat")!
-    private var modelName: String?
+    @Published private(set) var modelName: String?
+    @Published private(set) var availableChatModels: [LocalModelDescriptor] = []
+    @Published private(set) var modelSelectionLocked = false
+    @Published private(set) var isRefreshingModels = false
+    @Published private(set) var usesOllamaCatalog = false
+    @Published private(set) var lastPerformance: GenerationPerformance?
+    private let modelPreferences = ModelPreferences()
+    private var measurementStart: ContinuousClock.Instant?
     private var conversationID: UUID
     private var activeGenerationTask: Task<Void, Never>?
 
@@ -73,6 +80,7 @@ final class IlumAppModel: ObservableObject {
         guard !isSafeMode, !isSending, pendingApproval == nil else { return }
         activateConversation(UUID())
         messages = []
+        lastPerformance = nil
         draft = ""
         lastError = nil
         lastCitations = []
@@ -85,6 +93,7 @@ final class IlumAppModel: ObservableObject {
               summary.id != conversationID, let runtime else { return }
 
         activateConversation(summary.id)
+        lastPerformance = nil
         isSending = true
         lastError = nil
         lastCitations = []
@@ -167,6 +176,8 @@ final class IlumAppModel: ObservableObject {
         lastContextBudget = nil
         streamingText = ""
         generationStartedAt = Date()
+        measurementStart = .now
+        lastPerformance = GenerationPerformance(model: modelName ?? "unavailable", mode: supportsThinkingControl ? thinkingMode.rawValue : "server default")
         status = initialStatus
         let activeID = conversationID
 
@@ -174,6 +185,7 @@ final class IlumAppModel: ObservableObject {
             defer {
                 streamingText = ""
                 generationStartedAt = nil
+                measurementStart = nil
                 isSending = false
                 activeGenerationTask = nil
             }
@@ -190,8 +202,13 @@ final class IlumAppModel: ObservableObject {
                 case .deny(let id):
                     outcome = try await runtime.denyPermission(pendingID: id, onProgress: progress)
                 }
+                switch outcome {
+                case .completed: finishMeasurement(.completed)
+                case .permissionRequired: finishMeasurement(.awaitingPermission)
+                }
                 apply(outcome)
             } catch {
+                finishMeasurement(Task.isCancelled ? .cancelled : .failed)
                 await handleRuntimeError(error, runtime: runtime, conversationID: activeID)
                 if Task.isCancelled {
                     lastError = nil
@@ -211,7 +228,9 @@ final class IlumAppModel: ObservableObject {
             streamingText = ""
             status = "Waiting for model…"
         case .model(.thinking): status = "Model is thinking…"
+        case .model(.metrics(let metrics)): lastPerformance?.record(metrics)
         case .model(.textDelta(let text)):
+            if !text.isEmpty { lastPerformance?.recordFirstText(after: measurementElapsed()) }
             streamingText += text
             status = "Writing…"
         case .executingTool:
@@ -342,6 +361,8 @@ final class IlumAppModel: ObservableObject {
         streamingText = ""
         switch outcome {
         case .completed(let response):
+            // Buffered providers first reveal their text when the final answer is applied.
+            lastPerformance?.recordFirstText(after: measurementElapsed())
             pendingApproval = nil
             activateConversation(response.conversation.id)
             messages = response.conversation.messages
@@ -492,42 +513,121 @@ final class IlumAppModel: ObservableObject {
             modelEndpoint = base.appendingPathComponent("api/chat")
         }
         supportsThinkingControl = modelEndpoint.path == "/api/chat"
-
-        if let configuredName = environment["ILUM_MODEL"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines),
-           !configuredName.isEmpty {
-            modelName = configuredName
-            modelStatus = "Model: \(configuredName) — configured"
+        usesOllamaCatalog = supportsThinkingControl || modelEndpoint.port == 11434 || environment["ILUM_OLLAMA_TAGS_URL"] != nil
+        if let selection = OllamaModelCatalog.selectChatModel(from: [], configuredName: environment["ILUM_MODEL"]) {
+            modelName = selection.name
+            modelStatus = "Model: \(selection.name) — set by ILUM_MODEL"
+            modelSelectionLocked = true
             return
         }
-
-        if let configuredEndpoint,
-           configuredEndpoint.port != 11434,
-           environment["ILUM_OLLAMA_TAGS_URL"] == nil {
+        if !usesOllamaCatalog {
             modelName = "local"
             modelStatus = "Model: local — custom endpoint"
+            modelSelectionLocked = true
             return
         }
-
         modelStatus = "Discovering local Ollama models…"
         do {
-            var catalogURL = URLComponents(url: modelEndpoint, resolvingAgainstBaseURL: false)
-            catalogURL?.path = "/api/tags"
-            catalogURL?.query = nil
-            catalogURL?.fragment = nil
-            let tagsURL = environment["ILUM_OLLAMA_TAGS_URL"].flatMap(URL.init(string:)) ?? catalogURL?.url
-            let installed = try await OllamaModelCatalog(endpoint: tagsURL).models()
-            if let selected = OllamaModelCatalog.preferredChatModel(from: installed) {
-                modelName = selected.name
-                modelStatus = "Model: \(selected.name) — auto-detected"
-            } else {
-                modelName = nil
-                modelStatus = "Local model unavailable — install an Ollama chat model or set ILUM_MODEL"
-            }
+            let candidates = try await loadModelCandidates()
+            applyModelSelection(candidates)
         } catch {
             modelName = nil
-            modelStatus = "Local model unavailable — start Ollama or set ILUM_MODEL"
+            modelStatus = "Local model unavailable — refresh models or set ILUM_MODEL"
+            lastError = "Model discovery failed: \(error)"
         }
+    }
+
+    private func loadModelCandidates() async throws -> [LocalModelDescriptor] {
+        var catalogURL = URLComponents(url: modelEndpoint, resolvingAgainstBaseURL: false)
+        catalogURL?.path = "/api/tags"
+        catalogURL?.query = nil
+        catalogURL?.fragment = nil
+        let override = ProcessInfo.processInfo.environment["ILUM_OLLAMA_TAGS_URL"].flatMap(URL.init(string:))
+        let installed = try await OllamaModelCatalog(endpoint: override ?? catalogURL?.url).toolCapableModels()
+        return OllamaModelCatalog.chatCandidates(from: installed)
+    }
+
+    private func applyModelSelection(_ candidates: [LocalModelDescriptor]) {
+        availableChatModels = candidates
+        let savedName = modelPreferences.model(for: modelEndpoint)
+        if let selection = OllamaModelCatalog.selectChatModel(from: candidates, savedName: savedName) {
+            modelName = selection.name
+            let reason = selection.source == .saved ? "your selection" : (savedName == nil ? "automatic · smaller model first" : "saved model missing · automatic selection")
+            modelStatus = "Model: \(selection.name) — \(reason)"
+        } else {
+            modelName = nil
+            modelStatus = "No model with chat + tools — install one or set ILUM_MODEL"
+        }
+    }
+
+    func selectModel(_ name: String) {
+        guard !modelSelectionLocked, !isSending, !isRefreshingModels, !isSafeMode,
+              pendingApproval == nil, indexingResourceID == nil,
+              availableChatModels.contains(where: { $0.name == name }),
+              let store, let fileCatalog else { return }
+        let previous = modelName
+        modelName = name
+        do {
+            try configureRuntime(store: store, broker: fileCatalog)
+            modelPreferences.setModel(name, for: modelEndpoint)
+            modelStatus = "Model: \(name) — your selection"
+            lastError = nil
+            lastPerformance = nil
+        } catch {
+            modelName = previous
+            lastError = String(describing: error)
+        }
+    }
+
+    func refreshModels() {
+        guard runtime != nil, usesOllamaCatalog, !modelSelectionLocked, !isSending, !isRefreshingModels, !isSafeMode,
+              pendingApproval == nil, indexingResourceID == nil,
+              let store, let fileCatalog else { return }
+        isRefreshingModels = true
+        // Prevent sends and runtime reconfiguration while catalog discovery awaits I/O.
+        isSending = true
+        Task {
+            defer { isRefreshingModels = false; isSending = false }
+            do {
+                let candidates = try await loadModelCandidates()
+                let previousName = modelName
+                let previousStatus = modelStatus
+                let previousCandidates = availableChatModels
+                applyModelSelection(candidates)
+                do { try configureRuntime(store: store, broker: fileCatalog) }
+                catch {
+                    modelName = previousName; modelStatus = previousStatus; availableChatModels = previousCandidates
+                    throw error
+                }
+                lastPerformance = nil
+                lastError = nil
+            } catch {
+                lastError = "Model list could not be refreshed: \(error)"
+            }
+        }
+    }
+
+    func modelLabel(_ descriptor: LocalModelDescriptor) -> String {
+        guard let bytes = descriptor.sizeBytes, bytes > 0 else { return descriptor.name + " · size unknown" }
+        return descriptor.name + " · " + ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
+    }
+
+    func copyPerformanceReport() {
+        guard let lastPerformance else { return }
+        let system = ProcessInfo.processInfo
+        let hardware = "System: " + system.operatingSystemVersionString + "\nPhysical memory: " + ByteCountFormatter.string(fromByteCount: Int64(system.physicalMemory), countStyle: .memory)
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(lastPerformance.report + "\n" + hardware, forType: .string)
+    }
+
+    private func measurementElapsed() -> Double {
+        guard let measurementStart else { return 0 }
+        let duration = measurementStart.duration(to: .now).components
+        return Double(duration.seconds) + Double(duration.attoseconds) / 1e18
+    }
+
+    private func finishMeasurement(_ outcome: GenerationPerformance.Outcome) {
+        lastPerformance?.finish(outcome, after: measurementElapsed())
     }
 
     private func configureRuntime(

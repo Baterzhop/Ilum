@@ -37,6 +37,14 @@ Native tool-call assistant content/thinking is retained as optional provider con
 
 Fast sends `think: false`; Thinking sends `true`; Model default omits it. GPT-OSS uses `low`/`high`. Custom OpenAI-compatible endpoints retain their buffered protocol. There is no automatic protocol fallback or replay on a failed stream.
 
+## Model choice and performance diagnostics
+
+Model choice is explicit environment configuration, then an installed saved selection for the exact endpoint, then a deterministic smaller-known-file-size heuristic. Invalid/missing sizes are not treated as free models. Model names only break size ties. `/api/show` must confirm both `completion` and `tools` before a model appears in automatic/picker candidates. Metadata is probed with at most three concurrent five-second requests; unverified candidates are skipped, and an all-failed discovery is explicit. `ILUM_MODEL` bypasses discovery. Discovery is not repeated per user turn. The UI can refresh the catalog while idle and rebuilds the runtime only outside generation, indexing and permission decisions.
+
+Native terminal frames supply optional Ollama statistics in nanoseconds. They are decoded independently of the answer protocol, converted to seconds, and validated before use. Monotonic client timing records each completed model request and first content delta; thinking-only chunks do not count as visible text. Buffered OpenAI-compatible calls supply client elapsed time without pretending to stream or have server statistics.
+
+The macOS report is scoped to a single send or permission continuation. It records completed model calls, elapsed operation time, first visible text, and an explicit completed/permission/cancelled/failed state. Rates across calls are weighted by generation duration and shown only when all recorded calls provide the necessary statistics. Reports are transient and can be copied locally; prompts, retrieved text and reasoning are not included. They diagnose the actual machine; CI fixture times are not local-LLM performance claims.
+
 ## Runtime concurrency
 
 Swift actors are reentrant at `await`, so actor isolation alone is not a conversation-transaction boundary. `AgentRuntime` therefore owns an explicit conversation-scoped run lease.
