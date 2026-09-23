@@ -179,6 +179,35 @@ final class OllamaStreamingTests: XCTestCase {
         XCTAssertTrue(transport.wasCancelled())
     }
 
+    func testCancellationAfterApprovalRetainsToolResultAndClearsPendingExecution() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try SQLiteConversationStore(url: root.appendingPathComponent("chat.sqlite3"))
+        let initial = try makeRuntime(store: store, transport: ScriptedStreamTransport([[Data(toolFrame(done: true).utf8)]]), pendingStore: store)
+        let id = UUID()
+        guard case .permissionRequired(let pending) = try await initial.send("read", conversationID: id) else {
+            return XCTFail("Expected permission")
+        }
+        let transport = ControlledStreamTransport()
+        let resumed = try makeRuntime(store: store, transport: transport, pendingStore: store)
+        let preview = expectation(description: "Continuation has started after the approved tool")
+        let task = Task {
+            try await resumed.approvePermission(pendingID: pending.id, duration: .once, onProgress: { event in
+                if case .model(.textDelta("partial")) = event { preview.fulfill() }
+            })
+        }
+        await fulfillment(of: [preview], timeout: 5)
+        task.cancel()
+        do { _ = try await task.value; XCTFail("Must cancel generation") }
+        catch is CancellationError { }
+        let conversation = try await store.loadConversation(id: id)
+        XCTAssertEqual(conversation?.messages.map(\.role), [.user, .tool])
+        XCTAssertTrue(conversation?.messages.last?.content.contains("file contents") ?? false)
+        let stillPending = try await store.loadPendingExecution(conversationID: id)
+        XCTAssertNil(stillPending)
+        XCTAssertTrue(transport.wasCancelled())
+    }
+
     func testRuntimeRejectsFinalFromProviderThatIgnoresCancellation() async throws {
         let store = StreamingTestStore()
         let runtime = AgentRuntime(store: store, model: CancellationIgnoringModel())

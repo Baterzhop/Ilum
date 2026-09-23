@@ -44,31 +44,35 @@ private final class LoopbackFixture {
     let root: URL
     let marker: URL
     private let portFile: URL
+    private let logFile: URL
     private let process: Process
 
     init() throws {
         root = FileManager.default.temporaryDirectory.appendingPathComponent("ilum-stream-\(UUID().uuidString)")
         marker = root.appendingPathComponent("release")
         portFile = root.appendingPathComponent("port")
+        logFile = root.appendingPathComponent("server.log")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         let script = root.appendingPathComponent("server.py")
         try Self.python.write(to: script, atomically: true, encoding: .utf8)
         process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        process.arguments = ["python3", "-u", script.path, root.path]
+        process.arguments = ["python3", "-I", "-S", "-u", script.path, root.path]
         process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
+        _ = FileManager.default.createFile(atPath: logFile.path, contents: Data())
+        process.standardError = try FileHandle(forWritingTo: logFile)
         try process.run()
     }
 
     func endpoint() async throws -> URL {
-        for _ in 0..<250 {
+        let deadline = ContinuousClock.now.advanced(by: .seconds(15))
+        while ContinuousClock.now < deadline {
             if let text = try? String(contentsOf: portFile, encoding: .utf8), let port = Int(text),
                let url = URL(string: "http://127.0.0.1:\(port)/api/chat") { return url }
-            if !process.isRunning { throw FixtureError.serverFailed }
-            try await Task.sleep(for: .milliseconds(20))
+            if !process.isRunning { throw FixtureError.serverFailed((try? String(contentsOf: logFile, encoding: .utf8)) ?? "No fixture log") }
+            try await Task.sleep(for: .milliseconds(50))
         }
-        throw FixtureError.serverFailed
+        throw FixtureError.serverFailed((try? String(contentsOf: logFile, encoding: .utf8)) ?? "No fixture log")
     }
 
     func stop() {
@@ -76,9 +80,9 @@ private final class LoopbackFixture {
         try? FileManager.default.removeItem(at: root)
     }
 
-    private enum FixtureError: Error { case serverFailed }
+    private enum FixtureError: Error { case serverFailed(String) }
     private static let python = #"""
-import http.server, json, pathlib, sys, time
+import http.server, json, pathlib, socketserver, sys, time
 root = pathlib.Path(sys.argv[1])
 class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *args): pass
@@ -98,7 +102,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 time.sleep(0.01)
             frame('released' if (root / 'release').exists() else 'buffered', True)
         except (BrokenPipeError, ConnectionResetError): pass
-server = http.server.HTTPServer(('127.0.0.1', 0), Handler)
+# HTTPServer.server_bind performs a reverse DNS lookup. A loopback fixture must
+# never depend on runner DNS; this can stall startup on the macOS runners.
+class Server(http.server.HTTPServer):
+    def server_bind(self):
+        socketserver.TCPServer.server_bind(self)
+        self.server_name = 'localhost'
+        self.server_port = self.server_address[1]
+server = Server(('127.0.0.1', 0), Handler)
 (root / 'port').write_text(str(server.server_address[1]))
 server.handle_request()
 """#
