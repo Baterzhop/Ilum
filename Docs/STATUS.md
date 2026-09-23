@@ -26,7 +26,9 @@ This file separates implemented code from verified behavior and future work. A f
 | Permission execution binding | Implemented | one-shot grants are bound to the exact `ToolCall.id`; session grants remain read-only and resource-scoped |
 | Versioned conversation migrations | Implemented | numbered SQLite migrations; unknown newer or non-contiguous migration ledger fails closed |
 | Safe storage bootstrap | Implemented | critical conversation-store failure enters Safe Mode |
-| Local model transport | Implemented | OpenAI-compatible endpoint, explicit failures |
+| Local model transport | Implemented | Native Ollama NDJSON streaming; custom OpenAI-compatible endpoint remains buffered; explicit failures |
+| Response modes | Implemented | Fast / Thinking / Model default; GPT-OSS low/high mapping; actual model performance still requires physical testing |
+| Generation feedback | Implemented | transient text preview, elapsed seconds, Stop through permission continuations; partial responses not committed |
 | Local Ollama discovery | Implemented | deterministic chat-model selection; embedding-only models rejected |
 | Tool protocol/runtime | Implemented | typed registry and structured results |
 | Permission engine | Implemented | session read authority scoped by capability/resource; one-shot authority additionally scoped to exact execution |
@@ -59,6 +61,10 @@ Automated CI must be green for the exact commit proposed for release:
 CI status is intentionally not cached as a permanent claim in this document. Any commit after a green run creates a new release candidate and must pass the gates again on its exact SHA.
 
 Regression coverage includes:
+
+- fragmented UTF-8/NDJSON, missing terminal frames, response bounds and HTTP errors;
+- real URLSession incremental delivery and cancellation against a loopback HTTP fixture;
+- native tool context preserved across SQLite restart and approve/deny, with no execution from partial calls;
 
 - user input persisted before model execution;
 - same-conversation concurrent turns fail before a second user message can persist;

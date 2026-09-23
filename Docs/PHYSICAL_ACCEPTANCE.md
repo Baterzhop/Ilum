@@ -127,3 +127,14 @@ Runner навмисно не експортує Personal Memory DB, Knowledge DB
 4. переглянути report на physical failures/skips;
 5. переконатися, що Issue #2 відповідає продемонстрованій поведінці;
 6. лише після цього закривати Issue #2 та переводити PR у Ready for review.
+
+## Streaming and response modes
+
+On a build containing native Ollama streaming, use the default endpoint or explicitly set `ILUM_MODEL_URL=http://127.0.0.1:11434/api/chat`. An old explicit `/v1/chat/completions` export selects buffered compatibility mode.
+
+- Compare the same short prompt in Fast and Thinking; record model/Ollama version, Mac/RAM, cold/warm state, time to first visible text, and total duration. No universal latency target is claimed before measuring this setup.
+- Check that the user message appears before the answer and text grows during generation. Reasoning activity may appear before answer text.
+- Stop before the first token, during text, and during the model continuation after both Allow and Deny. Verify that partial answers disappear and a subsequent send works.
+- A completed authorized tool action remains in history if its following generation is cancelled. Stop does not undo that action.
+- Interrupt Ollama mid-stream and test a small output limit: show an explicit error, retain the user turn, and do not save a partial assistant answer or execute a partial tool call.
+- Restart with pending approval, then approve/deny: the original action/context must resume once. Check citations only appear as trusted sources after the final answer validates.

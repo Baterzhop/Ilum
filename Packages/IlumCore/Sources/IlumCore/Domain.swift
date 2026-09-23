@@ -43,6 +43,15 @@ public struct Conversation: Identifiable, Codable, Equatable, Sendable {
     }
 }
 
+/// Provider context needed to resume a native tool turn, never permission authority.
+public struct ToolAssistantContext: Codable, Equatable, Sendable {
+    public let content: String
+    public let thinking: String
+    public init(content: String, thinking: String) {
+        self.content = content; self.thinking = thinking
+    }
+}
+
 public struct ToolHistoryEvent: Codable, Equatable, Sendable {
     public enum Status: String, Codable, Sendable { case success, denied }
 
@@ -56,6 +65,7 @@ public struct ToolHistoryEvent: Codable, Equatable, Sendable {
     public let warnings: [ToolWarning]
     public let metadata: [String: JSONValue]
     public let detail: String?
+    public var assistantContext: ToolAssistantContext?
 
     public init(
         status: Status,
@@ -67,7 +77,8 @@ public struct ToolHistoryEvent: Codable, Equatable, Sendable {
         data: JSONValue? = nil,
         warnings: [ToolWarning] = [],
         metadata: [String: JSONValue] = [:],
-        detail: String? = nil
+        detail: String? = nil,
+        assistantContext: ToolAssistantContext? = nil
     ) {
         self.status = status
         self.callID = callID
@@ -79,8 +90,27 @@ public struct ToolHistoryEvent: Codable, Equatable, Sendable {
         self.warnings = warnings
         self.metadata = metadata
         self.detail = detail
+        self.assistantContext = assistantContext
     }
 }
+
+extension ToolHistoryEvent {
+    // Keep assistant context in its own protocol message, not duplicated in tool data.
+    func modelResultContent() throws -> String {
+        var result = self
+        result.assistantContext = nil
+        return String(decoding: try JSONEncoder().encode(result), as: UTF8.self)
+    }
+}
+
+public enum RuntimeProgress: Sendable {
+    case conversation(Conversation)
+    case retrievingKnowledge
+    case modelStarted
+    case model(ModelProgress)
+    case executingTool
+}
+public typealias RuntimeProgressHandler = @Sendable (RuntimeProgress) async -> Void
 
 public enum RuntimePhase: String, Codable, Sendable {
     case idle

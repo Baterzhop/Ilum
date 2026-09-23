@@ -25,6 +25,10 @@ final class IlumAppModel: ObservableObject {
     @Published var isMemoryAvailable = false
     @Published var isSafeMode = false
     @Published var isSending = false
+    @Published var streamingText = ""
+    @Published var generationStartedAt: Date?
+    @Published private(set) var thinkingMode = OllamaThinkingMode.fast
+    @Published private(set) var supportsThinkingControl = false
 
     private var runtime: AgentRuntime?
     private var store: SQLiteConversationStore?
@@ -38,17 +42,18 @@ final class IlumAppModel: ObservableObject {
     private let permissionEngine = PermissionEngine(
         automaticallyAllowedCapabilities: [.readAppData]
     )
-    private var modelEndpoint = URL(string: "http://127.0.0.1:11434/v1/chat/completions")!
+    private var modelEndpoint = URL(string: "http://127.0.0.1:11434/api/chat")!
     private var modelName: String?
     private var conversationID: UUID
     private var activeGenerationTask: Task<Void, Never>?
 
     var canStopGeneration: Bool {
-        isSending && activeGenerationTask != nil && pendingApproval == nil
+        isSending && activeGenerationTask != nil
     }
 
     init() {
         let defaults = UserDefaults.standard
+        thinkingMode = defaults.string(forKey: "ilum.thinkingMode").flatMap(OllamaThinkingMode.init(rawValue:)) ?? .fast
         if let stored = defaults.string(forKey: "ilum.activeConversationID"),
            let parsed = UUID(uuidString: stored) {
             conversationID = parsed
@@ -117,39 +122,8 @@ final class IlumAppModel: ObservableObject {
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty, !isSending, !isSafeMode, pendingApproval == nil,
               let runtime else { return }
-
         draft = ""
-        isSending = true
-        lastError = nil
-        lastCitations = []
-        lastContextBudget = nil
-        status = "Thinking…"
-        let activeID = conversationID
-
-        activeGenerationTask = Task {
-            defer {
-                isSending = false
-                activeGenerationTask = nil
-            }
-            do {
-                apply(try await runtime.send(text, conversationID: activeID))
-            } catch {
-                if Task.isCancelled {
-                    status = "Cancelled"
-                    lastError = nil
-                    if let restored = try? await runtime.loadConversation(id: activeID) {
-                        messages = restored.messages
-                    }
-                    await refreshConversationList()
-                } else {
-                    await handleRuntimeError(
-                        error,
-                        runtime: runtime,
-                        conversationID: activeID
-                    )
-                }
-            }
-        }
+        startGeneration(runtime: runtime, action: .send(text), initialStatus: "Preparing…")
     }
 
     func stopGeneration() {
@@ -160,46 +134,89 @@ final class IlumAppModel: ObservableObject {
 
     func approve(_ duration: GrantDuration) {
         guard let pendingApproval, let runtime, !isSending else { return }
-        isSending = true
-        lastError = nil
-        status = "Running authorized action…"
-
-        Task {
-            defer { isSending = false }
-            do {
-                apply(
-                    try await runtime.approvePermission(
-                        pendingID: pendingApproval.id,
-                        duration: duration
-                    )
-                )
-            } catch {
-                await handleRuntimeError(
-                    error,
-                    runtime: runtime,
-                    conversationID: conversationID
-                )
-            }
-        }
+        startGeneration(runtime: runtime, action: .approve(pendingApproval.id, duration), initialStatus: "Running authorized action…")
     }
 
     func deny() {
         guard let pendingApproval, let runtime, !isSending else { return }
+        startGeneration(runtime: runtime, action: .deny(pendingApproval.id), initialStatus: "Continuing without the action…")
+    }
+
+    func setThinkingMode(_ mode: OllamaThinkingMode) {
+        guard supportsThinkingControl, !isSending, pendingApproval == nil,
+              let store, let fileCatalog else { return }
+        let previous = thinkingMode
+        thinkingMode = mode
+        do {
+            try configureRuntime(store: store, broker: fileCatalog)
+            UserDefaults.standard.set(mode.rawValue, forKey: "ilum.thinkingMode")
+        } catch {
+            thinkingMode = previous
+            lastError = String(describing: error)
+        }
+    }
+
+    private enum GenerationAction {
+        case send(String), approve(UUID, GrantDuration), deny(UUID)
+    }
+
+    private func startGeneration(runtime: AgentRuntime, action: GenerationAction, initialStatus: String) {
         isSending = true
         lastError = nil
-        status = "Continuing without the action…"
+        lastCitations = []
+        lastContextBudget = nil
+        streamingText = ""
+        generationStartedAt = Date()
+        status = initialStatus
+        let activeID = conversationID
 
-        Task {
-            defer { isSending = false }
-            do {
-                apply(try await runtime.denyPermission(pendingID: pendingApproval.id))
-            } catch {
-                await handleRuntimeError(
-                    error,
-                    runtime: runtime,
-                    conversationID: conversationID
-                )
+        activeGenerationTask = Task {
+            defer {
+                streamingText = ""
+                generationStartedAt = nil
+                isSending = false
+                activeGenerationTask = nil
             }
+            let progress: RuntimeProgressHandler = { [weak self] event in
+                await self?.receive(event)
+            }
+            do {
+                let outcome: RuntimeOutcome
+                switch action {
+                case .send(let text):
+                    outcome = try await runtime.send(text, conversationID: activeID, onProgress: progress)
+                case .approve(let id, let duration):
+                    outcome = try await runtime.approvePermission(pendingID: id, duration: duration, onProgress: progress)
+                case .deny(let id):
+                    outcome = try await runtime.denyPermission(pendingID: id, onProgress: progress)
+                }
+                apply(outcome)
+            } catch {
+                await handleRuntimeError(error, runtime: runtime, conversationID: activeID)
+                if Task.isCancelled {
+                    lastError = nil
+                    status = pendingApproval == nil ? "Cancelled" : "Cancelled — permission still required"
+                }
+            }
+        }
+    }
+
+    private func receive(_ progress: RuntimeProgress) {
+        guard !Task.isCancelled else { return }
+        switch progress {
+        case .conversation(let conversation): messages = conversation.messages
+        case .retrievingKnowledge: status = "Searching Knowledge…"
+        case .modelStarted:
+            pendingApproval = nil
+            streamingText = ""
+            status = "Waiting for model…"
+        case .model(.thinking): status = "Model is thinking…"
+        case .model(.textDelta(let text)):
+            streamingText += text
+            status = "Writing…"
+        case .executingTool:
+            streamingText = ""
+            status = "Running tool…"
         }
     }
 
@@ -322,6 +339,7 @@ final class IlumAppModel: ObservableObject {
     }
 
     private func apply(_ outcome: RuntimeOutcome) {
+        streamingText = ""
         switch outcome {
         case .completed(let response):
             pendingApproval = nil
@@ -353,10 +371,8 @@ final class IlumAppModel: ObservableObject {
         if let restored = try? await runtime.loadConversation(id: conversationID) {
             messages = restored.messages
         }
-        if let pending = try? await runtime.restorePendingPermission(conversationID: conversationID) {
-            pendingApproval = pending
-            messages = pending.conversation.messages
-        }
+        pendingApproval = try? await runtime.restorePendingPermission(conversationID: conversationID)
+        if let pendingApproval { messages = pendingApproval.conversation.messages }
         await refreshKnowledgeRetrievalStatus()
         await refreshConversationList()
     }
@@ -472,7 +488,10 @@ final class IlumAppModel: ObservableObject {
         let configuredEndpoint = environment["ILUM_MODEL_URL"].flatMap(URL.init(string:))
         if let configuredEndpoint {
             modelEndpoint = configuredEndpoint
+        } else if let base = environment["ILUM_OLLAMA_BASE_URL"].flatMap(URL.init(string:)) {
+            modelEndpoint = base.appendingPathComponent("api/chat")
         }
+        supportsThinkingControl = modelEndpoint.path == "/api/chat"
 
         if let configuredName = environment["ILUM_MODEL"]?
             .trimmingCharacters(in: .whitespacesAndNewlines),
@@ -492,7 +511,12 @@ final class IlumAppModel: ObservableObject {
 
         modelStatus = "Discovering local Ollama models…"
         do {
-            let installed = try await OllamaModelCatalog().models()
+            var catalogURL = URLComponents(url: modelEndpoint, resolvingAgainstBaseURL: false)
+            catalogURL?.path = "/api/tags"
+            catalogURL?.query = nil
+            catalogURL?.fragment = nil
+            let tagsURL = environment["ILUM_OLLAMA_TAGS_URL"].flatMap(URL.init(string:)) ?? catalogURL?.url
+            let installed = try await OllamaModelCatalog(endpoint: tagsURL).models()
             if let selected = OllamaModelCatalog.preferredChatModel(from: installed) {
                 modelName = selected.name
                 modelStatus = "Model: \(selected.name) — auto-detected"
@@ -557,11 +581,16 @@ final class IlumAppModel: ObservableObject {
 
         let provider: any ModelProvider
         if let modelName {
-            provider = OpenAICompatibleProvider(
-                endpoint: modelEndpoint,
-                model: modelName,
-                systemPrompt: makeSystemPrompt()
-            )
+            if supportsThinkingControl {
+                provider = OllamaChatProvider(
+                    endpoint: modelEndpoint, model: modelName,
+                    thinkingMode: thinkingMode, systemPrompt: makeSystemPrompt()
+                )
+            } else {
+                provider = OpenAICompatibleProvider(
+                    endpoint: modelEndpoint, model: modelName, systemPrompt: makeSystemPrompt()
+                )
+            }
         } else {
             provider = UnavailableModelProvider(reason: modelStatus)
         }

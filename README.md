@@ -98,7 +98,7 @@ When `ILUM_MODEL` is not set, Ilum inspects the local Ollama catalog and determi
 ### Explicit model configuration
 
 ```bash
-export ILUM_MODEL_URL="http://127.0.0.1:11434/v1/chat/completions"
+export ILUM_MODEL_URL="http://127.0.0.1:11434/api/chat"
 export ILUM_MODEL="your-installed-local-model"
 export ILUM_OLLAMA_EMBED_URL="http://127.0.0.1:11434/api/embed"
 export ILUM_EMBED_MODEL="nomic-embed-text"
@@ -116,7 +116,7 @@ export ILUM_OUTPUT_TOKENS=1024
 export ILUM_CONTEXT_SAFETY_TOKENS=512
 ```
 
-`ILUM_OUTPUT_TOKENS` reserves output space in the context budget and is also sent to the OpenAI-compatible server as `max_tokens`. If the provider reports `finish_reason: length`, Ilum reports the limit explicitly instead of saving a partial answer as complete or executing a truncated tool call. Provider behavior, including whether reasoning tokens consume this limit, should be checked against the installed model server.
+`ILUM_OUTPUT_TOKENS` reserves output space in the context budget and is sent as native Ollama `options.num_predict` or OpenAI-compatible `max_tokens`. If the provider reports `done_reason: length` or `finish_reason: length`, Ilum reports the limit explicitly instead of saving a partial answer as complete or executing a truncated tool call. Provider behavior, including whether reasoning tokens consume this limit, should be checked against the installed model server.
 
 If a request cannot fit the current context budget, the runtime fails explicitly.
 
@@ -124,9 +124,15 @@ If a request cannot fit the current context budget, the runtime fails explicitly
 
 Development is focused on Ilum. LumiOrigin remains historical reference material for selective feature migration, especially spreadsheet tools; it is not a second active implementation line.
 
-The first latency change removes unnecessary embedding calls, adds dense-failure cooldown, and enforces the reserved output budget in the model request. Streaming, explicit Ollama thinking profiles, full-request context accounting, and incremental chat persistence remain separate follow-up work. These changes do not claim a measured speedup on the target Mac.
+Ilum skips unnecessary embedding calls, applies a dense-failure cooldown, and enforces the reserved output budget. Native Ollama chat now streams text as it arrives. The composer offers **Fast** (default), **Thinking**, and **Model default**; the choice is saved locally. Fast sends `think: false`, Thinking sends `think: true`, and Model default omits the field. GPT-OSS uses `low`/`high` instead of booleans and cannot fully disable thinking. Unsupported settings produce an explicit server error; use Model default for a model without thinking support.
 
-For a physical check, compare the same short question with (1) no indexed documents, (2) an indexed text PDF, and (3) an unavailable embedding endpoint. Repeat the third case immediately to check sparse cooldown. Confirm citations still refer to the indexed document, Stop still cancels a generation, and an intentionally small output budget reports truncation explicitly. Record the exact build, Mac/RAM, Ollama/model version, cold versus warm start, and complete response time. CI mocks verify request counts and protocol behavior; they do not benchmark the installed LLM.
+The default endpoint is `/api/chat`. An explicitly configured OpenAI-compatible `/v1/chat/completions` endpoint retains buffered responses and has no thinking selector. Change an old Ollama `ILUM_MODEL_URL` export to `/api/chat` (or remove it) to enable the new behavior. `doctor.sh --chat` checks the native Fast request by default, using a buffered smoke response; it does not measure UI streaming or read the app's saved mode.
+
+The UI shows the saved user message immediately, current activity, elapsed seconds, and a temporary answer preview. Stop cancels the network generation, including generation after approve/deny. Already completed authorized tool actions are retained. A partial, cancelled, malformed, or length-truncated answer never becomes a completed chat entry; tool calls require a complete valid stream before permission/execution. The source bar appears only after citation validation.
+
+Full-request context accounting and incremental chat persistence remain follow-up work. These changes do not claim a measured speedup on the target Mac.
+
+For a physical check, compare the same short question with (1) no indexed documents, (2) an indexed text PDF, and (3) an unavailable embedding endpoint. Repeat the third case immediately to check sparse cooldown. Confirm citations still refer to the indexed document, Stop still cancels a generation, and an intentionally small output budget reports truncation explicitly. Record the exact build, Mac/RAM, Ollama/model version, cold versus warm start, time to first visible text, and complete response time in Fast and Thinking. Check Stop both before the first token and after a permission continuation. CI tests verify protocol behavior and actual incremental URLSession delivery using a loopback HTTP server; they do not benchmark the installed LLM.
 
 ## Release discipline
 

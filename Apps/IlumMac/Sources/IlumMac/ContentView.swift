@@ -208,7 +208,8 @@ struct ContentView: View {
 
     private var conversation: some View {
         ScrollViewReader { proxy in
-            List(visibleMessages) { message in
+            List {
+                ForEach(visibleMessages) { message in
                 VStack(alignment: .leading, spacing: 5) {
                     Text(message.role == .user ? "You" : "Ilum")
                         .font(.caption)
@@ -218,6 +219,18 @@ struct ContentView: View {
                 }
                 .padding(.vertical, 4)
                 .id(message.id)
+                }
+                if !model.streamingText.isEmpty {
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text("Ilum · generating")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Text(model.streamingText)
+                            .textSelection(.enabled)
+                    }
+                    .padding(.vertical, 4)
+                    .id("streaming-preview")
+                }
             }
             .overlay {
                 if visibleMessages.isEmpty {
@@ -230,6 +243,9 @@ struct ContentView: View {
                             .foregroundStyle(.secondary)
                     }
                 }
+            }
+            .onChange(of: model.streamingText) { _ in
+                if !model.streamingText.isEmpty { proxy.scrollTo("streaming-preview", anchor: .bottom) }
             }
             .onChange(of: visibleMessages.count) { _ in
                 if let last = visibleMessages.last {
@@ -285,6 +301,29 @@ struct ContentView: View {
 
     private var composer: some View {
         VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                if model.supportsThinkingControl {
+                    Picker("Response mode", selection: Binding(
+                        get: { model.thinkingMode }, set: { model.setThinkingMode($0) }
+                    )) {
+                        Text("Fast").tag(OllamaThinkingMode.fast)
+                        Text("Thinking").tag(OllamaThinkingMode.thinking)
+                        Text("Model default").tag(OllamaThinkingMode.modelDefault)
+                    }
+                    .pickerStyle(.menu)
+                    .fixedSize()
+                    .disabled(model.isSending || model.pendingApproval != nil || model.isSafeMode)
+                    .help("Fast disables thinking where supported (GPT-OSS: low). Thinking requests deeper reasoning and may take longer. Model default leaves the setting to Ollama.")
+                }
+                Spacer()
+                if let started = model.generationStartedAt {
+                    TimelineView(.periodic(from: started, by: 1)) { context in
+                        Text("Elapsed: \(max(0, Int(context.date.timeIntervalSince(started)))) s")
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
             if let error = model.lastError {
                 Text(error)
                     .font(.caption)
