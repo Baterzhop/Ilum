@@ -114,10 +114,12 @@ public struct ToolCall: Identifiable, Equatable, Codable, Sendable {
     public let name: String
     public let version: String
     public let arguments: Data
+    public let assistantContext: ToolAssistantContext?
 
-    public init(id: UUID = UUID(), providerCallID: String? = nil, name: String, version: String, arguments: Data) {
+    public init(id: UUID = UUID(), providerCallID: String? = nil, name: String, version: String, arguments: Data, assistantContext: ToolAssistantContext? = nil) {
         self.id = id; self.providerCallID = providerCallID ?? id.uuidString
         self.name = name; self.version = version; self.arguments = arguments
+        self.assistantContext = assistantContext
     }
 
     public static func encoding<Input: Encodable & Sendable>(

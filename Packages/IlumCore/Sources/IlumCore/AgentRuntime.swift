@@ -33,11 +33,12 @@ public actor AgentRuntime {
         self.maxToolSteps = max(1, maxToolSteps)
     }
 
-    public func send(_ text: String, conversationID: UUID, title: String = "New conversation") async throws -> RuntimeOutcome {
+    public func send(_ text: String, conversationID: UUID, title: String = "New conversation", onProgress: @escaping RuntimeProgressHandler = { _ in }) async throws -> RuntimeOutcome {
         let normalized = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !normalized.isEmpty else { throw AgentRuntimeError.emptyInput }
 
         do {
+            try Task.checkCancellation()
             lastError = nil
             try beginConversationRun(conversationID)
             defer { endConversationRun(conversationID) }
@@ -58,10 +59,13 @@ public actor AgentRuntime {
             conversation.updatedAt = Date()
             phase = .persistingUserMessage
             try await store.saveConversation(conversation)
+            await onProgress(.conversation(conversation))
+            try Task.checkCancellation()
 
             let groundedContext: GroundedContext?
             if let contextProvider {
                 phase = .retrievingKnowledge
+                await onProgress(.retrievingKnowledge)
                 groundedContext = try await contextProvider.context(for: normalized)
             } else {
                 groundedContext = nil
@@ -70,7 +74,8 @@ public actor AgentRuntime {
                 conversation: conversation,
                 conversationID: conversationID,
                 completedToolSteps: 0,
-                groundedContext: groundedContext
+                groundedContext: groundedContext,
+                onProgress: onProgress
             )
         } catch {
             if isConcurrencyGuardError(error) {
@@ -87,9 +92,10 @@ public actor AgentRuntime {
         }
     }
 
-    public func approvePermission(pendingID: UUID, duration: GrantDuration) async throws -> RuntimeOutcome {
+    public func approvePermission(pendingID: UUID, duration: GrantDuration, onProgress: @escaping RuntimeProgressHandler = { _ in }) async throws -> RuntimeOutcome {
         guard let toolRuntime else { throw AgentRuntimeError.toolsUnavailable }
         do {
+            try Task.checkCancellation()
             lastError = nil
             try beginPendingResolution(pendingID)
             defer { endPendingResolution(pendingID) }
@@ -101,12 +107,15 @@ public actor AgentRuntime {
             defer { endConversationRun(pending.conversationID) }
 
             let livePermission = try await validatedPermission(for: pending)
+            try Task.checkCancellation()
             _ = await toolRuntime.grant(
                 livePermission,
                 duration: duration,
                 callID: pending.call.id
             )
             phase = .executingTool
+            await onProgress(.executingTool)
+            try Task.checkCancellation()
 
             switch try await toolRuntime.execute(pending.call) {
             case .permissionRequired(let changedRequest):
@@ -132,7 +141,8 @@ public actor AgentRuntime {
                     conversation: conversation,
                     conversationID: pending.conversationID,
                     completedToolSteps: pending.completedToolSteps + 1,
-                    groundedContext: pending.groundedContext
+                    groundedContext: pending.groundedContext,
+                    onProgress: onProgress
                 )
             }
         } catch {
@@ -145,8 +155,9 @@ public actor AgentRuntime {
         }
     }
 
-    public func denyPermission(pendingID: UUID) async throws -> RuntimeOutcome {
+    public func denyPermission(pendingID: UUID, onProgress: @escaping RuntimeProgressHandler = { _ in }) async throws -> RuntimeOutcome {
         do {
+            try Task.checkCancellation()
             lastError = nil
             try beginPendingResolution(pendingID)
             defer { endPendingResolution(pendingID) }
@@ -168,7 +179,8 @@ public actor AgentRuntime {
                 conversation: conversation,
                 conversationID: pending.conversationID,
                 completedToolSteps: pending.completedToolSteps + 1,
-                groundedContext: pending.groundedContext
+                groundedContext: pending.groundedContext,
+                onProgress: onProgress
             )
         } catch {
             if isConcurrencyGuardError(error) {
@@ -219,8 +231,13 @@ public actor AgentRuntime {
         conversation: Conversation,
         conversationID: UUID,
         completedToolSteps: Int,
-        groundedContext: GroundedContext?
+        groundedContext: GroundedContext?,
+        onProgress: @escaping RuntimeProgressHandler
     ) async throws -> RuntimeOutcome {
+        try Task.checkCancellation()
+        await onProgress(.conversation(conversation))
+        await onProgress(.modelStarted)
+        try Task.checkCancellation()
         phase = .waitingForModel
         let tools: [ToolDescriptor]
         if let toolRuntime { tools = await toolRuntime.descriptors() } else { tools = [] }
@@ -232,8 +249,10 @@ public actor AgentRuntime {
                 availableTools: tools,
                 groundedContext: pack.groundedContext,
                 maxOutputTokens: contextBudgetManager.policy.reservedOutputTokens
-            )
+            ),
+            onProgress: { await onProgress(.model($0)) }
         )
+        try Task.checkCancellation()
 
         switch turn {
         case .final(let content):
@@ -261,6 +280,8 @@ public actor AgentRuntime {
             }
             guard let toolRuntime else { throw AgentRuntimeError.toolsUnavailable }
             phase = .executingTool
+            await onProgress(.executingTool)
+            try Task.checkCancellation()
             switch try await toolRuntime.execute(call) {
             case .permissionRequired(let request):
                 return try await suspendForPermission(
@@ -277,7 +298,8 @@ public actor AgentRuntime {
                     conversation: updated,
                     conversationID: conversationID,
                     completedToolSteps: completedToolSteps + 1,
-                    groundedContext: groundedContext
+                    groundedContext: groundedContext,
+                    onProgress: onProgress
                 )
             }
         }
@@ -376,7 +398,8 @@ public actor AgentRuntime {
             data: success.data,
             warnings: success.warnings,
             metadata: success.metadata,
-            detail: nil
+            detail: nil,
+            assistantContext: call.assistantContext
         )
         return try await appendToolEvent(event, to: conversation, resolvingPendingID: resolvingPendingID)
     }
@@ -394,7 +417,8 @@ public actor AgentRuntime {
             tool: call.name,
             version: call.version,
             arguments: try decodeToolArguments(call.arguments),
-            detail: "User denied \(request.capability.rawValue) for \(request.resource.identifier)."
+            detail: "User denied \(request.capability.rawValue) for \(request.resource.identifier).",
+            assistantContext: call.assistantContext
         )
         return try await appendToolEvent(event, to: conversation, resolvingPendingID: resolvingPendingID)
     }

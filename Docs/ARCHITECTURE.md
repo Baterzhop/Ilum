@@ -14,7 +14,7 @@ User
        -> persist user turn (SQLite)
        -> retrieve immutable grounded-context snapshot
        -> ContextBudgetManager
-       -> OpenAICompatibleProvider
+       -> OllamaChatProvider / OpenAICompatibleProvider
             -> final answer
             OR typed ToolCall
        -> ToolRuntime
@@ -26,6 +26,16 @@ User
 ```
 
 A grounded-context snapshot is created once for a user turn and reused across tool/permission pauses. If a permission-gated turn is interrupted by app termination, Ilum persists that exact evidence snapshot with the pending ToolCall and resumes from it after restart instead of running retrieval again.
+
+## Streaming and model modes
+
+The macOS default uses Ollama native `/api/chat` with NDJSON streaming. The URLSession data delegate works on macOS and Linux and closes the task/session on cancellation or completion. Parsing accepts fragmented UTF-8 and multiple frames per network read, requires a terminal `done`, and caps a frame at 1 MiB and a response at 8 MiB. HTTP failures, malformed/incomplete streams, and reported output truncation are explicit errors. A complete native tool call is checked against the registered wire name and object arguments before being returned to ToolRuntime.
+
+Progress callbacks are scoped to each send/approve/deny invocation. They expose text deltas and a thinking activity signal, not reasoning text. Preview text is transient UI state; citations and durable assistant history are produced only after completion. A cancellation check after provider return also protects against a provider ignoring cancellation. Completed authorized tool results remain durable when subsequent generation is cancelled.
+
+Native tool-call assistant content/thinking is retained as optional provider context in ToolCall and ToolHistoryEvent so a resumed tool turn can reconstruct the native assistant/tool exchange after restart. Old payloads decode without these optional fields. This context does not grant authority and is not duplicated into the tool-result message. Ordinary final-answer reasoning is not persisted.
+
+Fast sends `think: false`; Thinking sends `true`; Model default omits it. GPT-OSS uses `low`/`high`. Custom OpenAI-compatible endpoints retain their buffered protocol. There is no automatic protocol fallback or replay on a failed stream.
 
 ## Runtime concurrency
 
@@ -115,7 +125,7 @@ Exact vector scanning is intentionally correctness-first. An ANN/HNSW implementa
 
 ## Context management
 
-`ContextBudgetManager` reserves output and safety space, accounts for grounded evidence, and packs the newest usable history into the remaining model window. The reserved output amount is forwarded as the model request's `max_tokens`. A provider-reported length truncation is an explicit error before final-answer persistence or tool-call execution.
+`ContextBudgetManager` reserves output and safety space, accounts for grounded evidence, and packs the newest usable history into the remaining model window. The reserved output amount is forwarded as native Ollama `options.num_predict` or OpenAI-compatible `max_tokens`. A provider-reported length truncation is an explicit error before final-answer persistence or tool-call execution.
 
 The current estimator uses a fixed system allowance and packs individual messages. Accounting for the complete serialized prompt/tool schemas and preserving whole user/tool turns during history compaction remain follow-up work. An oversized selected context fails explicitly.
 

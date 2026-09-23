@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OLLAMA_BASE_URL="${ILUM_OLLAMA_BASE_URL:-http://127.0.0.1:11434}"
 TAGS_URL="${ILUM_OLLAMA_TAGS_URL:-${OLLAMA_BASE_URL}/api/tags}"
-CHAT_URL="${ILUM_MODEL_URL:-${OLLAMA_BASE_URL}/v1/chat/completions}"
+CHAT_URL="${ILUM_MODEL_URL:-${OLLAMA_BASE_URL}/api/chat}"
 CHAT_SMOKE=0
 
 if [[ "${1:-}" == "--chat" ]]; then
@@ -85,13 +85,22 @@ fi
 printf 'INFO  Chat endpoint: %s\n' "$CHAT_URL"
 
 if [[ "$CHAT_SMOKE" -eq 1 ]]; then
-  PAYLOAD="$(python3 - "$MODEL" <<'PY'
+  PAYLOAD="$(python3 - "$MODEL" "$CHAT_URL" "${ILUM_OUTPUT_TOKENS:-1024}" <<'PY'
 import json, sys
-print(json.dumps({
+from urllib.parse import urlparse
+payload = {
     'model': sys.argv[1],
     'messages': [{'role': 'user', 'content': 'Reply with exactly ILUM_OK'}],
     'stream': False,
-}))
+}
+limit = max(1, int(sys.argv[3]))
+if urlparse(sys.argv[2]).path == '/api/chat':
+    family = sys.argv[1].lower().split('/')[-1].split(':')[0]
+    payload['think'] = 'low' if family.startswith('gpt-oss') else False
+    payload['options'] = {'num_predict': limit}
+else:
+    payload['max_tokens'] = limit
+print(json.dumps(payload))
 PY
 )"
 
@@ -106,7 +115,13 @@ import json, sys
 with open(sys.argv[1], 'r', encoding='utf-8') as f:
     payload = json.load(f)
 try:
-    print((payload['choices'][0]['message'].get('content') or '').strip())
+    if payload.get('done_reason') == 'length':
+        print('')
+    elif 'message' in payload:
+        print((payload['message'].get('content') or '').strip() if payload.get('done') else '')
+    else:
+        choice = payload['choices'][0]
+        print((choice['message'].get('content') or '').strip() if choice.get('finish_reason') != 'length' else '')
 except Exception:
     print('')
 PY
