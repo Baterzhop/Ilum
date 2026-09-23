@@ -1,0 +1,75 @@
+name: Ilum CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+concurrency:
+  group: ilum-ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  core-tests:
+    name: IlumCore tests (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate helper scripts
+        run: bash -n Scripts/doctor.sh Scripts/run.sh Scripts/build-app.sh Scripts/acceptance.sh
+      - name: Install SQLite headers
+        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
+      - name: Swift version
+        run: swift --version
+      - name: Test IlumCore
+        working-directory: Packages/IlumCore
+        run: swift test
+
+  core-macos:
+    name: IlumCore tests (macOS)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate helper scripts with macOS system Bash
+        run: /bin/bash -n Scripts/doctor.sh Scripts/run.sh Scripts/build-app.sh Scripts/acceptance.sh
+      - name: Swift version
+        run: swift --version
+      - name: Test IlumCore
+        working-directory: Packages/IlumCore
+        run: swift test
+
+  mac-app:
+    name: IlumMac build + tests (macOS)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate acceptance runner with macOS system Bash
+        run: /bin/bash -n Scripts/acceptance.sh
+      - name: Swift version
+        run: swift --version
+      - name: Test IlumMac support
+        working-directory: Apps/IlumMac
+        run: swift test
+      - name: Build IlumMac
+        working-directory: Apps/IlumMac
+        run: swift build
+      - name: Package Ilum.app
+        run: bash Scripts/build-app.sh
+      - name: Verify app bundle
+        run: |
+          test -x dist/Ilum.app/Contents/MacOS/IlumMac
+          plutil -lint dist/Ilum.app/Contents/Info.plist
+          codesign --verify --deep --strict dist/Ilum.app
+      - name: Archive Ilum.app
+        run: ditto -c -k --sequesterRsrc --keepParent dist/Ilum.app dist/Ilum.app.zip
+      - name: Upload Ilum macOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Ilum-macOS
+          path: dist/Ilum.app.zip
+          if-no-files-found: error
+          retention-days: 14
