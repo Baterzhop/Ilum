@@ -19,6 +19,7 @@ public enum ModelTurn: Sendable { case final(String), toolCall(ToolCall) }
 public enum ModelProgress: Sendable, Equatable {
     case thinking
     case textDelta(String)
+    case metrics(ModelResponseMetrics)
 }
 public typealias ModelProgressHandler = @Sendable (ModelProgress) async -> Void
 
@@ -97,6 +98,14 @@ public struct OpenAICompatibleProvider: ModelProvider, Sendable {
         self.model = model ?? env["ILUM_MODEL"] ?? "local"
         self.systemPrompt = systemPrompt
         self.transport = transport
+    }
+
+    public func respond(to request: ModelRequest, onProgress: @escaping ModelProgressHandler) async throws -> ModelTurn {
+        let started = ContinuousClock.now
+        let turn = try await respond(to: request)
+        try Task.checkCancellation()
+        await onProgress(.metrics(ModelResponseMetrics(requestSeconds: started.duration(to: .now).ilumSeconds)))
+        return turn
     }
 
     public func respond(to request: ModelRequest) async throws -> ModelTurn {

@@ -29,7 +29,9 @@ This file separates implemented code from verified behavior and future work. A f
 | Local model transport | Implemented | Native Ollama NDJSON streaming; custom OpenAI-compatible endpoint remains buffered; explicit failures |
 | Response modes | Implemented | Fast / Thinking / Model default; GPT-OSS low/high mapping; actual model performance still requires physical testing |
 | Generation feedback | Implemented | transient text preview, elapsed seconds, Stop through permission continuations; partial responses not committed |
-| Local Ollama discovery | Implemented | deterministic chat-model selection; embedding-only models rejected |
+| Local Ollama discovery | Implemented | smaller-known-file-size choice among models reporting completion + tools; missing metadata is not guessed |
+| Model picker | Implemented | saved per endpoint, refresh while idle, explicit environment override preserved |
+| Performance diagnostics | Implemented | client elapsed/first-text timing; optional Ollama load/prompt/generation/token statistics; copyable report without conversation content |
 | Tool protocol/runtime | Implemented | typed registry and structured results |
 | Permission engine | Implemented | session read authority scoped by capability/resource; one-shot authority additionally scoped to exact execution |
 | User-file boundary | Implemented | security-scoped selection + opaque resource IDs |

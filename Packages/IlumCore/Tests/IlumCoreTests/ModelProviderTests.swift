@@ -6,6 +6,22 @@ import XCTest
 @testable import IlumCore
 
 final class ModelProviderTests: XCTestCase {
+    func testBufferedProviderReportsClientTimeWithoutInventingServerStatistics() async throws {
+        let transport = CapturingHTTPTransport(response: "{\"choices\":[{\"message\":{\"content\":\"answer\"}}]}")
+        let recorder = BufferedMetricRecorder()
+        _ = try await OpenAICompatibleProvider(model: "custom", transport: transport).respond(
+            to: ModelRequest(messages: []), onProgress: { await recorder.record($0) }
+        )
+        let events = await recorder.values()
+        XCTAssertEqual(events.count, 1)
+        guard case .metrics(let metrics) = events[0] else { return XCTFail("Expected client timing only") }
+        XCTAssertGreaterThanOrEqual(metrics.requestSeconds, 0)
+        XCTAssertNil(metrics.firstTextSeconds)
+        XCTAssertNil(metrics.loadSeconds)
+        XCTAssertNil(metrics.generatedTokens)
+        XCTAssertNil(metrics.generatedTokensPerSecond)
+    }
+
     func testRuntimeSendsTheReservedOutputBudgetToTheRealWirePayload() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("ilum-output-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: root) }
@@ -207,4 +223,10 @@ private actor CapturingHTTPTransport: HTTPTransport {
     func lastRequest() -> URLRequest? {
         capturedRequest
     }
+}
+
+private actor BufferedMetricRecorder {
+    private var events: [ModelProgress] = []
+    func record(_ progress: ModelProgress) { events.append(progress) }
+    func values() -> [ModelProgress] { events }
 }

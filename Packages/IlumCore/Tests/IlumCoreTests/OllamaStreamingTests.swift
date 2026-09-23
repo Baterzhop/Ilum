@@ -21,12 +21,68 @@ final class OllamaStreamingTests: XCTestCase {
         guard case .final(let answer) = turn else { return XCTFail("Expected final") }
         XCTAssertEqual(answer, "Привіт 🌍!")
         let events = await recorder.values()
-        XCTAssertEqual(events, [.thinking, .textDelta("Привіт 🌍"), .textDelta("!")])
+        let contentEvents = events.filter { if case .metrics = $0 { return false }; return true }
+        XCTAssertEqual(contentEvents, [.thinking, .textDelta("Привіт 🌍"), .textDelta("!")])
+        XCTAssertEqual(events.filter { if case .metrics = $0 { return true }; return false }.count, 1)
         let payload = try payload(transport.requests()[0])
         XCTAssertEqual(payload["stream"] as? Bool, true)
         XCTAssertEqual(payload["think"] as? Bool, false)
         XCTAssertEqual((payload["options"] as? [String: Any])?["num_predict"] as? Int, 256)
         XCTAssertEqual(transport.cancellations(), 1)
+    }
+
+    func testTerminalMetricsConvertNanosecondsAndMeasureFirstVisibleText() async throws {
+        let source = """
+        {"message":{"thinking":"reasoning only"},"done":false}
+        {"message":{"content":"answer"},"done":false}
+        {"message":{"content":""},"done":true,"done_reason":"stop","total_duration":6000000000,"load_duration":1000000000,"prompt_eval_duration":2000000000,"eval_duration":3000000000,"prompt_eval_count":120,"eval_count":60}
+        """
+        let recorder = ProgressRecorder()
+        _ = try await OllamaChatProvider(model: "test", transport: ScriptedStreamTransport([[Data(source.utf8)]])).respond(
+            to: ModelRequest(messages: []), onProgress: { await recorder.record($0) }
+        )
+        let events = await recorder.values()
+        let metrics = try XCTUnwrap(events.compactMap { if case .metrics(let value) = $0 { return value }; return nil }.first)
+        XCTAssertEqual(metrics.serverTotalSeconds, 6)
+        XCTAssertEqual(metrics.loadSeconds, 1)
+        XCTAssertEqual(metrics.promptSeconds, 2)
+        XCTAssertEqual(metrics.generationSeconds, 3)
+        XCTAssertEqual(metrics.promptTokens, 120)
+        XCTAssertEqual(metrics.generatedTokens, 60)
+        XCTAssertEqual(metrics.generatedTokensPerSecond, 20)
+        XCTAssertNotNil(metrics.firstTextSeconds)
+        XCTAssertGreaterThanOrEqual(metrics.requestSeconds, metrics.firstTextSeconds ?? 0)
+    }
+
+    func testOptionalMalformedTelemetryDoesNotDiscardAnswerOrFabricateZeroMeasurements() async throws {
+        let source = """
+        {"message":{"content":"complete"},"done":true,"load_duration":-1,"prompt_eval_duration":"bad","eval_duration":0,"eval_count":40,"prompt_eval_count":-10}
+        """
+        let recorder = ProgressRecorder()
+        let turn = try await OllamaChatProvider(model: "test", transport: ScriptedStreamTransport([[Data(source.utf8)]])).respond(
+            to: ModelRequest(messages: []), onProgress: { await recorder.record($0) }
+        )
+        guard case .final("complete") = turn else { return XCTFail("Telemetry must not break the answer") }
+        let events = await recorder.values()
+        let metrics = try XCTUnwrap(events.compactMap { if case .metrics(let value) = $0 { return value }; return nil }.first)
+        XCTAssertNil(metrics.serverTotalSeconds)
+        XCTAssertNil(metrics.loadSeconds)
+        XCTAssertNil(metrics.promptSeconds)
+        XCTAssertNil(metrics.promptTokens)
+        XCTAssertNil(metrics.generatedTokensPerSecond)
+    }
+
+    func testInterruptedStreamDoesNotEmitCompletionMetrics() async throws {
+        let recorder = ProgressRecorder()
+        let source = "{\"message\":{\"content\":\"partial\"},\"done\":false,\"eval_count\":10}\n"
+        do {
+            _ = try await OllamaChatProvider(model: "test", transport: ScriptedStreamTransport([[Data(source.utf8)]])).respond(
+                to: ModelRequest(messages: []), onProgress: { await recorder.record($0) }
+            )
+            XCTFail("Expected incomplete stream")
+        } catch is ModelProviderError { }
+        let events = await recorder.values()
+        XCTAssertFalse(events.contains { if case .metrics = $0 { return true }; return false })
     }
 
     func testThinkingProfilesUseNativeFieldsIncludingGPTOSSLevels() async throws {

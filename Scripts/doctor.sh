@@ -43,8 +43,15 @@ else
   fail "Ollama is not reachable at $TAGS_URL. Start Ollama, or set ILUM_OLLAMA_BASE_URL / ILUM_OLLAMA_TAGS_URL."
 fi
 
-DISCOVERED_MODEL="$(python3 - "$TAGS_FILE" <<'PY'
+DISCOVERED_MODEL="$(python3 - "$TAGS_FILE" "$TAGS_URL" "${ILUM_MODEL:-}" <<'PY'
 import json, sys
+if sys.argv[3].strip():
+    print(sys.argv[3].strip())
+    sys.exit(0)
+from urllib.parse import urlsplit, urlunsplit
+from urllib.request import Request, urlopen
+parts = urlsplit(sys.argv[2])
+show_url = urlunsplit(parts._replace(path='/api/show'))
 path = sys.argv[1]
 with open(path, 'r', encoding='utf-8') as f:
     payload = json.load(f)
@@ -66,20 +73,31 @@ for item in payload.get('models', []):
     if 'gemma' in lower: score += 14
     if 'phi' in lower: score += 10
     models.append((score, size, name.lower(), name))
-models.sort(key=lambda x: (-x[0], -x[1], x[2]))
-print(models[0][3] if models else '')
+models.sort(key=lambda x: (x[1] <= 0, x[1] if x[1] > 0 else 0, -x[0], x[2], x[3]))
+selected = ''
+for _, _, _, name in models:
+    try:
+        request = Request(show_url, data=json.dumps({'model': name}).encode(), headers={'Content-Type': 'application/json'})
+        with urlopen(request, timeout=5) as response:
+            capabilities = json.load(response).get('capabilities', [])
+        if 'completion' in capabilities and 'tools' in capabilities:
+            selected = name
+            break
+    except Exception:
+        print(f'WARN  Could not verify capabilities for {name}', file=sys.stderr)
+print(selected)
 PY
 )"
 
 MODEL="${ILUM_MODEL:-$DISCOVERED_MODEL}"
 if [[ -z "$MODEL" ]]; then
-  fail "No local chat model was found. Install an Ollama chat/instruct model, or set ILUM_MODEL."
+  fail "No verified local model with chat and tool support was found. Refresh/update Ollama, install a compatible model, or set ILUM_MODEL explicitly."
 fi
 
 if [[ -n "${ILUM_MODEL:-}" ]]; then
   pass "Chat model configured explicitly: $MODEL"
 else
-  pass "Chat model auto-detected: $MODEL"
+  pass "Chat model auto-detected (smaller known model first): $MODEL"
 fi
 
 printf 'INFO  Chat endpoint: %s\n' "$CHAT_URL"
