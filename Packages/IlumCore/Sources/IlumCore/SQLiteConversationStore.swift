@@ -109,7 +109,7 @@ public actor SQLiteConversationStore: ConversationStore, PendingExecutionStore {
         try Self.execute(db, sql: "BEGIN IMMEDIATE TRANSACTION;")
         do {
             try upsertConversation(conversation, db: db)
-            try replaceMessages(conversation, db: db)
+            try synchronizeMessages(conversation, db: db)
             try Self.execute(db, sql: "COMMIT;")
         } catch {
             try? Self.execute(db, sql: "ROLLBACK;")
@@ -211,7 +211,7 @@ public actor SQLiteConversationStore: ConversationStore, PendingExecutionStore {
         try Self.execute(db, sql: "BEGIN IMMEDIATE TRANSACTION;")
         do {
             try upsertConversation(conversation, db: db)
-            try replaceMessages(conversation, db: db)
+            try synchronizeMessages(conversation, db: db)
 
             var statement: OpaquePointer?
             try prepare(
@@ -285,29 +285,74 @@ public actor SQLiteConversationStore: ConversationStore, PendingExecutionStore {
         try stepDone(statement, db: db)
     }
 
-    private func replaceMessages(_ conversation: Conversation, db: OpaquePointer) throws {
-        var deleteStatement: OpaquePointer?
-        try prepare(db, sql: "DELETE FROM messages WHERE conversation_id = ?1;", statement: &deleteStatement)
-        bind(conversation.id.uuidString, to: deleteStatement, index: 1)
-        try stepDone(deleteStatement, db: db)
-        sqlite3_finalize(deleteStatement)
+    /// Preserve unchanged rows. Snapshot comparison is still O(history), but disk
+    /// mutations and prepared writes are limited to inserted/changed/removed rows.
+    /// Runs inside the caller's transaction, including pending-turn resolution.
+    private func synchronizeMessages(_ conversation: Conversation, db: OpaquePointer) throws {
+        let incomingIDs = Set(conversation.messages.map(\.id))
+        guard incomingIDs.count == conversation.messages.count else {
+            throw SQLiteStoreError.corruptData("duplicate message IDs in conversation")
+        }
 
-        let sql = "INSERT INTO messages (id, conversation_id, role, content, created_at, sequence_number) VALUES (?1, ?2, ?3, ?4, ?5, ?6);"
+        var existing: [UUID: (message: ChatMessage, sequence: Int)] = [:]
+        var read: OpaquePointer?
+        try prepare(db, sql: "SELECT id, role, content, created_at, sequence_number FROM messages WHERE conversation_id = ?1;", statement: &read)
+        defer { sqlite3_finalize(read) }
+        bind(conversation.id.uuidString, to: read, index: 1)
+        while true {
+            let result = sqlite3_step(read)
+            if result == SQLITE_DONE { break }
+            guard result == SQLITE_ROW else { throw SQLiteStoreError.executionFailed(errorMessage(db)) }
+            guard let id = UUID(uuidString: text(read, column: 0)),
+                  let role = ChatRole(rawValue: text(read, column: 1)) else {
+                throw SQLiteStoreError.corruptData("invalid message identity or role")
+            }
+            existing[id] = (ChatMessage(
+                id: id, role: role, content: text(read, column: 2),
+                createdAt: Date(timeIntervalSince1970: sqlite3_column_double(read, 3))
+            ), Int(sqlite3_column_int64(read, 4)))
+        }
+
+        var deletion: OpaquePointer?
+        try prepare(db, sql: "DELETE FROM messages WHERE id = ?1 AND conversation_id = ?2;", statement: &deletion)
+        defer { sqlite3_finalize(deletion) }
+        for id in existing.keys where !incomingIDs.contains(id) {
+            sqlite3_reset(deletion)
+            sqlite3_clear_bindings(deletion)
+            bind(id.uuidString, to: deletion, index: 1)
+            bind(conversation.id.uuidString, to: deletion, index: 2)
+            try stepDone(deletion, db: db)
+        }
+
+        let sql = """
+        INSERT INTO messages (id, conversation_id, role, content, created_at, sequence_number)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+        ON CONFLICT(id) DO UPDATE SET
+            role = excluded.role, content = excluded.content,
+            created_at = excluded.created_at, sequence_number = excluded.sequence_number
+        WHERE messages.conversation_id = excluded.conversation_id;
+        """
+        var statement: OpaquePointer?
+        try prepare(db, sql: sql, statement: &statement)
+        defer { sqlite3_finalize(statement) }
         for (index, message) in conversation.messages.enumerated() {
-            var statement: OpaquePointer?
-            try prepare(db, sql: sql, statement: &statement)
+            if let previous = existing[message.id], previous.message.role == message.role,
+               previous.message.content == message.content,
+               previous.message.createdAt.timeIntervalSince1970 == message.createdAt.timeIntervalSince1970,
+               previous.sequence == index {
+                continue
+            }
+            sqlite3_reset(statement)
+            sqlite3_clear_bindings(statement)
             bind(message.id.uuidString, to: statement, index: 1)
             bind(conversation.id.uuidString, to: statement, index: 2)
             bind(message.role.rawValue, to: statement, index: 3)
             bind(message.content, to: statement, index: 4)
             sqlite3_bind_double(statement, 5, message.createdAt.timeIntervalSince1970)
             sqlite3_bind_int64(statement, 6, sqlite3_int64(index))
-            do {
-                try stepDone(statement, db: db)
-                sqlite3_finalize(statement)
-            } catch {
-                sqlite3_finalize(statement)
-                throw error
+            try stepDone(statement, db: db)
+            guard sqlite3_changes(db) == 1 else {
+                throw SQLiteStoreError.corruptData("message ID belongs to another conversation")
             }
         }
     }

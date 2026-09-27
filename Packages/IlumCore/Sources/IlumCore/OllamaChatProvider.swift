@@ -33,6 +33,13 @@ public struct OllamaChatProvider: ModelProvider, Sendable {
         self.systemPrompt = systemPrompt; self.transport = transport
     }
 
+    public func contextCosts(for request: ModelRequest, estimator: any TokenEstimating, messageOverhead: Int) throws -> ModelContextCosts? {
+        try ModelMessageBuilder(systemPrompt: systemPrompt).contextCosts(
+            for: request, estimator: estimator, messageOverhead: messageOverhead,
+            transform: { try OllamaMessage($0) }
+        )
+    }
+
     public func respond(to request: ModelRequest) async throws -> ModelTurn {
         try await respond(to: request, onProgress: { _ in })
     }
@@ -47,7 +54,7 @@ public struct OllamaChatProvider: ModelProvider, Sendable {
             model: model, messages: messages, stream: true,
             think: thinkingMode.value(for: model),
             tools: request.availableTools.isEmpty ? nil : request.availableTools.map(ModelMessageBuilder.makeToolDefinition),
-            options: .init(numPredict: request.maxOutputTokens)
+            options: .init(numPredict: request.maxOutputTokens, numContext: request.contextWindow)
         )
         var urlRequest = URLRequest(url: endpoint)
         urlRequest.httpMethod = "POST"
@@ -191,7 +198,8 @@ private struct OllamaRequest: Encodable {
     let options: Options
     struct Options: Encodable {
         let numPredict: Int
-        enum CodingKeys: String, CodingKey { case numPredict = "num_predict" }
+        let numContext: Int
+        enum CodingKeys: String, CodingKey { case numPredict = "num_predict"; case numContext = "num_ctx" }
     }
 }
 

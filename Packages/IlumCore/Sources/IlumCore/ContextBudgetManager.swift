@@ -52,6 +52,18 @@ public struct ContextBudgetReport: Codable, Hashable, Sendable {
     public let fits: Bool
 }
 
+/// Additive estimates for a provider's rendered messages, tool schemas and instructions.
+public struct ModelContextCosts: Sendable {
+    public let messageTokens: [Int]
+    public let fixedTokens: Int
+    public let knowledgeTokens: Int
+    public init(messageTokens: [Int], fixedTokens: Int, knowledgeTokens: Int) {
+        self.messageTokens = messageTokens
+        self.fixedTokens = fixedTokens
+        self.knowledgeTokens = knowledgeTokens
+    }
+}
+
 public struct ContextBudgetPack: Sendable {
     public let messages: [ChatMessage]
     public let groundedContext: GroundedContext?
@@ -67,31 +79,54 @@ public struct ContextBudgetManager: Sendable {
     }
 
     public func pack(messages: [ChatMessage], groundedContext: GroundedContext?) -> ContextBudgetPack {
-        let inputBudget = max(0, policy.contextWindow - policy.reservedOutputTokens - policy.safetyMarginTokens - policy.fixedSystemTokens)
-        let knowledgeTokens = estimator.estimateTokens(in: groundedContext?.renderedText ?? "")
-        var remaining = inputBudget - knowledgeTokens
-        var selectedReversed: [ChatMessage] = []
-        var historyTokens = 0
-        var fits = remaining >= 0
+        pack(messages: messages, groundedContext: groundedContext, costs: nil)
+    }
 
-        for message in messages.reversed() {
-            let cost = estimator.estimateTokens(in: message.content) + policy.perMessageOverheadTokens
-            if selectedReversed.isEmpty {
-                selectedReversed.append(message)
-                historyTokens += cost
-                remaining -= cost
-                if remaining < 0 { fits = false }
-                continue
+    public func pack(request: ModelRequest, model: any ModelProvider) throws -> ContextBudgetPack {
+        let costs = try model.contextCosts(for: request, estimator: estimator, messageOverhead: policy.perMessageOverheadTokens)
+        if let costs {
+            guard costs.messageTokens.count == request.messages.count,
+                  costs.fixedTokens >= 0, costs.knowledgeTokens >= 0,
+                  costs.messageTokens.allSatisfy({ $0 >= 0 }) else {
+                throw ModelProviderError.invalidResponse
             }
-            guard cost <= remaining else { break }
-            selectedReversed.append(message)
+        }
+        return pack(messages: request.messages, groundedContext: request.groundedContext, costs: costs)
+    }
+
+    private func pack(messages: [ChatMessage], groundedContext: GroundedContext?, costs profile: ModelContextCosts?) -> ContextBudgetPack {
+        let fixedTokens = max(policy.fixedSystemTokens, profile?.fixedTokens ?? 0)
+        let availableInput = max(0, policy.contextWindow - policy.reservedOutputTokens - policy.safetyMarginTokens)
+        let inputBudget = max(0, availableInput - fixedTokens)
+        let knowledgeTokens = profile?.knowledgeTokens ?? estimator.estimateTokens(in: groundedContext?.renderedText ?? "")
+        // Pin explicit system messages and keep each user turn with all of its
+        // tool results/assistant messages. Never leave a tool continuation without
+        // its user request, or silently drop the active request to fit a result.
+        let costs = profile?.messageTokens ?? messages.map { estimator.estimateTokens(in: $0.content) + policy.perMessageOverheadTokens }
+        var selectedIndices = Set<Int>()
+        var turns: [[Int]] = []
+        for (index, message) in messages.enumerated() {
+            if message.role == .system {
+                selectedIndices.insert(index)
+            } else {
+                if message.role == .user || turns.isEmpty { turns.append([]) }
+                turns[turns.count - 1].append(index)
+            }
+        }
+        var historyTokens = selectedIndices.reduce(0) { $0 + costs[$1] }
+        var remaining = inputBudget - knowledgeTokens - historyTokens
+        for (offset, turn) in turns.reversed().enumerated() {
+            let cost = turn.reduce(0) { $0 + costs[$1] }
+            // The active turn is mandatory; report overflow instead of truncating it.
+            guard offset == 0 || cost <= remaining else { break }
+            selectedIndices.formUnion(turn)
             historyTokens += cost
             remaining -= cost
         }
-
-        let selected = Array(selectedReversed.reversed())
-        let estimated = knowledgeTokens + historyTokens + policy.fixedSystemTokens
-        fits = fits && estimated <= (inputBudget + policy.fixedSystemTokens)
+        let selected = messages.enumerated().compactMap { selectedIndices.contains($0.offset) ? $0.element : nil }
+        var fits = remaining >= 0
+        let estimated = knowledgeTokens + historyTokens + fixedTokens
+        fits = fits && estimated <= availableInput
         return ContextBudgetPack(
             messages: selected,
             groundedContext: groundedContext,

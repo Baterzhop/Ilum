@@ -67,10 +67,15 @@ struct ContentView: View {
             }
 
             if let budget = model.lastContextBudget {
-                Text("Context: \(budget.estimatedInputTokens)/\(budget.inputBudgetTokens)")
+                Text("Context estimate: \(budget.historyTokens + budget.knowledgeTokens)/\(budget.inputBudgetTokens)")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                    .help("Dropped history messages: \(budget.droppedMessageCount)")
+                    .help("Estimated history and document tokens; system and output reserves are separate.")
+                if budget.droppedMessageCount > 0 {
+                    Text("\(budget.droppedMessageCount) older messages omitted from this response; full chat remains saved.")
+                        .font(.caption2)
+                        .foregroundStyle(.orange)
+                }
             }
 
             Spacer()

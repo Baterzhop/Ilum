@@ -147,3 +147,21 @@ On a build containing native Ollama streaming, use the default endpoint or expli
 - Expand/copy the performance report. Check that elapsed, first text, load, prompt and generation times are plausible for the observed request. Server values can be absent; absent values must not display as zero.
 - Cancel a request and interrupt Ollama. Reports must say Cancelled/Failed. Repeat with a tool continuation and verify the new timing excludes time spent waiting for the permission decision.
 - Compare useful answer quality and successful tool calls alongside speed. A smaller file is not proof that the model is suitable for every task.
+
+
+## Long chat and incremental history checks
+
+- Keep an existing chat/database when installing this build; no new schema migration is required.
+- Open a long conversation, send another message, quit and reopen. Check ordering,
+  old text, the new question/answer, and the conversation title; no duplicates.
+- Stop a streaming response, reopen the chat and continue. The question remains;
+  an unfinished assistant response must not appear as a completed answer.
+- Repeat the existing allow/deny/restart permission scenarios in a long chat.
+- With enough history to exceed the configured context budget, check the visible
+  omitted-message notice. Older messages remain in the saved chat; they are not
+  automatically summarized or remembered by the model in this change.
+- An oversized active request/tool turn must fail explicitly, not answer a different
+  question because the user's request was removed.
+- Compare elapsed/first-text diagnostics on the same model with short and long chats.
+  Delta writes reduce database mutations, but reading/comparing a snapshot and context
+  packing remain linear in history size. No target-Mac speedup is claimed by CI.

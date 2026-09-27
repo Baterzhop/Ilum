@@ -17,7 +17,7 @@ This file separates implemented code from verified behavior and future work. A f
 | Swift 6 core | Implemented | `Packages/IlumCore` |
 | Native macOS app | Implemented | SwiftUI executable in `Apps/IlumMac` |
 | Native app packaging | Implemented | `Scripts/build-app.sh` creates `dist/Ilum.app`; signing/notarization is not yet a public-distribution claim |
-| Conversation persistence | Implemented | SQLite, survives reopen |
+| Conversation persistence | Implemented | SQLite transactionally synchronizes changed/new/deleted message rows; unchanged rows are retained; snapshot comparison remains O(history) |
 | Multi-conversation UI | Implemented | durable catalog, New Chat, switching stored conversations |
 | Conversation run isolation | Implemented | one active turn/permission continuation per conversation; different conversations may run concurrently |
 | Pending resolution isolation | Implemented | duplicate concurrent approve/deny for the same pending transaction fails fast |
@@ -41,7 +41,7 @@ This file separates implemented code from verified behavior and future work. A f
 | Dense retrieval | Implemented | optional local Ollama embeddings + persistent vector index |
 | Hybrid fusion | Implemented | Reciprocal Rank Fusion with sparse fallback |
 | Retrieval-mode visibility | Implemented | macOS header exposes hybrid, sparse fallback, sparse or unavailable mode after retrieval |
-| Context budgeting | Implemented | current turn is never silently removed |
+| Context budgeting | Implemented | provider-aware wire-field estimates; Ollama num_ctx aligned; complete turns/system messages retained; oversized requests fail before network; omitted history stays saved |
 | Grounded citations | Implemented | `[K#]` markers validated against exact evidence snapshot |
 | Personal Memory | Implemented | dedicated SQLite store; read lookup may be local-policy allowed, writes/deletion require approval |
 | Multilingual policy | Implemented at runtime-prompt level | model capability still determines language quality |
