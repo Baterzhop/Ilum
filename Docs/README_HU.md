@@ -8,6 +8,8 @@ Az Ilum nem egyszerű LLM-chatfelület. A cél egy privát digitális assziszten
 
 ## Alapelv
 
+Elérhető egy [németországi / NRW földmérési tudástár](GEODESY_NRW.md): 28 rövid témakör, köztük az Erhebungserlass és a GRZ, hivatalos forrásokkal és verziójelöléssel. A **Geodäsie** gomb offline keresőt nyit; a chat a `geodesy.search` eszközt használhatja. Ez kezdeti gyűjtemény, nem teljes jogszabály-adatbázis, és nincs automatikus frissítése.
+
 Az Ilum **local-first / offline-first** rendszer. Az alapműködéshez nincs szükség felhős MI API-ra: a generatív modell és az embedding modell is futhat ugyanazon a Macen. Az architektúra nem függ OpenAI-, Anthropic- vagy más külső szolgáltatótól.
 
 Az Ilum feladata, hogy:

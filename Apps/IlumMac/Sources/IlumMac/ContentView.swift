@@ -4,6 +4,7 @@ import IlumCore
 
 struct ContentView: View {
     @EnvironmentObject private var model: IlumAppModel
+    @State private var showingGeodesyReference = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -24,6 +25,9 @@ struct ContentView: View {
             }
             Divider()
             composer
+        }
+        .sheet(isPresented: $showingGeodesyReference) {
+            GeodesyReferenceView()
         }
     }
 
@@ -79,6 +83,13 @@ struct ContentView: View {
             }
 
             Spacer()
+
+            Button {
+                showingGeodesyReference = true
+            } label: {
+                Label("Geodäsie", systemImage: "map")
+            }
+            .help("German and NRW surveying references — available offline")
 
             Button {
                 model.newConversation()
