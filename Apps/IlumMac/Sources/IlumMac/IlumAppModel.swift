@@ -635,7 +635,8 @@ final class IlumAppModel: ObservableObject {
         broker: any UserFileAccessBroker
     ) throws {
         var registeredTools: [AnyTool] = [
-            AnyTool(ReadTextFileTool(broker: broker))
+            AnyTool(ReadTextFileTool(broker: broker)),
+            AnyTool(GeodesySearchTool())
         ]
         if let memoryStore {
             registeredTools.append(AnyTool(MemorySearchTool(store: memoryStore)))
@@ -740,6 +741,8 @@ final class IlumAppModel: ObservableObject {
         Use memory.search only when stable personal context can materially improve the answer; do not query memory mechanically on every turn.
         Propose memory.remember when the user explicitly asks you to remember/save something, or when a clearly stable preference or goal is intentionally meant to persist. Never store passwords, authentication secrets, recovery codes, or private keys.
         Use memory.forget only when the user asks to remove a specific remembered item. Memory writes and deletion require explicit user approval.
+        For German surveying, NRW cadastral/building rules, Erhebungserlass or GRZ/GFZ questions, use geodesy.search with specific German or Ukrainian topic keywords. It is a curated offline reference, not a live or comprehensive legal database. If no entry matches, say the topic is not covered; do not fabricate a provision.
+        In geodesy answers cite the returned official source URL, section and source edition, distinguish federal, state and municipal rules, and retain relevant cautions. The review date is not the legal effective date. Never claim that current law was checked online. For project-specific application ask for Bundesland, municipality, project date and applicable Bebauungsplan/BauNVO edition where relevant. Do not generalize NRW provisions to other states or treat a GRZ example as approval to build.
         """
 
         if memoryStore == nil {

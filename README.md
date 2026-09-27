@@ -36,6 +36,7 @@ Legacy Lumi branches are reference material only. Ilum has one product architect
 - local Ollama model discovery that rejects embedding/reranker models as chat candidates
 - explicit unavailable-model behavior instead of fabricated fallback answers
 - multilingual same-language response policy
+- offline German/NRW surveying reference: 28 curated topics, German/Ukrainian keyword search, official-source links and source editions, accessible through the Geodäsie window and `geodesy.search` ([scope and limitations](Docs/GEODESY_NRW.md))
 - versioned conversation-schema migrations with fail-closed newer/non-contiguous migration protection
 - Linux/macOS Core CI plus native macOS build/test/package gates
 - guided physical macOS acceptance runner with an exact-SHA evidence report

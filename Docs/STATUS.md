@@ -16,6 +16,7 @@ This file separates implemented code from verified behavior and future work. A f
 | --- | --- | --- |
 | Swift 6 core | Implemented | `Packages/IlumCore` |
 | Native macOS app | Implemented | SwiftUI executable in `Apps/IlumMac` |
+| German/NRW geodesy reference | Implemented; physical/model acceptance pending | 28 curated summaries; offline browser and read-only `geodesy.search`; source editions and limitations in `Docs/GEODESY_NRW.md`; no full legal corpus or automatic updater |
 | Native app packaging | Implemented | `Scripts/build-app.sh` creates `dist/Ilum.app`; signing/notarization is not yet a public-distribution claim |
 | Conversation persistence | Implemented | SQLite transactionally synchronizes changed/new/deleted message rows; unchanged rows are retained; snapshot comparison remains O(history) |
 | Multi-conversation UI | Implemented | durable catalog, New Chat, switching stored conversations |

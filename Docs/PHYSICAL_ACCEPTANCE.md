@@ -4,6 +4,8 @@
 
 GitHub Actions перевіряє компіляцію, regression/security tests, пакування, `Info.plist`, codesign і macOS-сумісність helper scripts. Але CI не може довести, що Ilum правильно працює саме на реальному Mac із локально встановленим Ollama, реальними security-scoped permissions та реальною поведінкою UI.
 
+Додаткова перевірка довідника геодезиста описана в [GEODESY_NRW.md](GEODESY_NRW.md#перевірка-на-реальному-mac): офлайн-вікно, пошук DE/UA, джерела в чаті та розмежування юрисдикцій. Ці нові пункти поки виконуються вручну окремо від guided runner.
+
 ## Один рекомендований запуск
 
 На Mac, у чистому checkout поточного `integration/ilum-v1`:
