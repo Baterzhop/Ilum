@@ -120,7 +120,9 @@ export ILUM_CONTEXT_SAFETY_TOKENS=512
 
 `ILUM_OUTPUT_TOKENS` reserves output space in the context budget and is sent as native Ollama `options.num_predict` or OpenAI-compatible `max_tokens`. If the provider reports `done_reason: length` or `finish_reason: length`, Ilum reports the limit explicitly instead of saving a partial answer as complete or executing a truncated tool call. Provider behavior, including whether reasoning tokens consume this limit, should be checked against the installed model server.
 
-If a request cannot fit the current context budget, the runtime fails explicitly.
+`ILUM_CONTEXT_WINDOW` is also sent to native Ollama as `options.num_ctx`. Custom OpenAI-compatible servers must be configured with a matching or larger context window separately. Built-in providers estimate rendered system instructions, tool definitions, evidence and tool-history messages; counts remain heuristic and reserve safety space.
+
+If a request cannot fit the current context budget, the runtime fails explicitly. History is selected in complete user turns; omitted older messages remain saved and are indicated in the UI.
 
 ### Performance work
 
@@ -136,7 +138,7 @@ Expand the performance summary below the response controls to inspect elapsed ti
 
 For an A/B comparison, open a new chat for each model, send the same short prompt, and save the reports for the first and second request. Compare answer quality and tool behavior as well as time. `doctor.sh` follows the smaller-model automatic policy but does not read the UI's saved selection; set `ILUM_MODEL` to test the same model explicitly.
 
-Full-request context accounting and incremental chat persistence remain follow-up work. These changes do not claim a measured speedup on the target Mac.
+Message persistence now writes only snapshot differences. Full-request heuristic accounting and complete-turn packing are implemented; exact tokenizer integration, summaries and paginated history remain follow-up work. These changes do not claim a measured speedup on the target Mac.
 
 For a physical check, compare the same short question with (1) no indexed documents, (2) an indexed text PDF, and (3) an unavailable embedding endpoint. Repeat the third case immediately to check sparse cooldown. Confirm citations still refer to the indexed document, Stop still cancels a generation, and an intentionally small output budget reports truncation explicitly. Record the exact build, Mac/RAM, Ollama/model version, cold versus warm start, time to first visible text, and complete response time in Fast and Thinking. Check Stop both before the first token and after a permission continuation. CI tests verify protocol behavior and actual incremental URLSession delivery using a loopback HTTP server; they do not benchmark the installed LLM.
 

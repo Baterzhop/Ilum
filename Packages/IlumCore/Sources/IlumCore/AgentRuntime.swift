@@ -241,14 +241,19 @@ public actor AgentRuntime {
         phase = .waitingForModel
         let tools: [ToolDescriptor]
         if let toolRuntime { tools = await toolRuntime.descriptors() } else { tools = [] }
-        let pack = contextBudgetManager.pack(messages: conversation.messages, groundedContext: groundedContext)
+        let pack = try contextBudgetManager.pack(request: ModelRequest(
+            messages: conversation.messages, availableTools: tools, groundedContext: groundedContext,
+            maxOutputTokens: contextBudgetManager.policy.reservedOutputTokens,
+            contextWindow: contextBudgetManager.policy.contextWindow
+        ), model: model)
         guard pack.report.fits else { throw AgentRuntimeError.contextBudgetExceeded }
         let turn = try await model.respond(
             to: ModelRequest(
                 messages: pack.messages,
                 availableTools: tools,
                 groundedContext: pack.groundedContext,
-                maxOutputTokens: contextBudgetManager.policy.reservedOutputTokens
+                maxOutputTokens: contextBudgetManager.policy.reservedOutputTokens,
+                contextWindow: contextBudgetManager.policy.contextWindow
             ),
             onProgress: { await onProgress(.model($0)) }
         )

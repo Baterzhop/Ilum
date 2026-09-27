@@ -8,10 +8,12 @@ public struct ModelRequest: Sendable {
     public let availableTools: [ToolDescriptor]
     public let groundedContext: GroundedContext?
     public let maxOutputTokens: Int
+    public let contextWindow: Int
 
-    public init(messages: [ChatMessage], availableTools: [ToolDescriptor] = [], groundedContext: GroundedContext? = nil, maxOutputTokens: Int = 1_024) {
+    public init(messages: [ChatMessage], availableTools: [ToolDescriptor] = [], groundedContext: GroundedContext? = nil, maxOutputTokens: Int = 1_024, contextWindow: Int = 8_192) {
         self.messages = messages; self.availableTools = availableTools; self.groundedContext = groundedContext
         self.maxOutputTokens = max(1, maxOutputTokens)
+        self.contextWindow = max(1_024, contextWindow)
     }
 }
 
@@ -24,11 +26,15 @@ public enum ModelProgress: Sendable, Equatable {
 public typealias ModelProgressHandler = @Sendable (ModelProgress) async -> Void
 
 public protocol ModelProvider: Sendable {
+    func contextCosts(for request: ModelRequest, estimator: any TokenEstimating, messageOverhead: Int) throws -> ModelContextCosts?
     func respond(to request: ModelRequest) async throws -> ModelTurn
     func respond(to request: ModelRequest, onProgress: @escaping ModelProgressHandler) async throws -> ModelTurn
 }
 
 public extension ModelProvider {
+    // Custom providers keep the legacy heuristic unless they expose wire costs.
+    func contextCosts(for request: ModelRequest, estimator: any TokenEstimating, messageOverhead: Int) throws -> ModelContextCosts? { nil }
+
     func respond(to request: ModelRequest, onProgress: @escaping ModelProgressHandler) async throws -> ModelTurn {
         try await respond(to: request)
     }
@@ -100,6 +106,12 @@ public struct OpenAICompatibleProvider: ModelProvider, Sendable {
         self.transport = transport
     }
 
+    public func contextCosts(for request: ModelRequest, estimator: any TokenEstimating, messageOverhead: Int) throws -> ModelContextCosts? {
+        try ModelMessageBuilder(systemPrompt: systemPrompt).contextCosts(
+            for: request, estimator: estimator, messageOverhead: messageOverhead, transform: { $0 }
+        )
+    }
+
     public func respond(to request: ModelRequest, onProgress: @escaping ModelProgressHandler) async throws -> ModelTurn {
         let started = ContinuousClock.now
         let turn = try await respond(to: request)
@@ -162,30 +174,74 @@ struct ModelMessageBuilder {
     let systemPrompt: String
 
     func makeAPIMessages(from messages: [ChatMessage], availableTools: [ToolDescriptor], groundedContext: GroundedContext?) throws -> [APIRequestMessage] {
-        var output = [APIRequestMessage(role: "system", content: systemPrompt)]
-        if groundedContext != nil { output.append(APIRequestMessage(role: "system", content: Self.groundedContextPolicy)) }
+        var output = systemMessages(hasKnowledge: groundedContext != nil)
         let groundedUserID = groundedContext == nil ? nil : messages.last(where: { $0.role == .user })?.id
-
         for message in messages {
-            switch message.role {
-            case .system: output.append(APIRequestMessage(role: "system", content: message.content))
-            case .user:
-                if message.id == groundedUserID, let groundedContext {
-                    output.append(APIRequestMessage(role: "user", content: Self.groundedUserContent(query: message.content, context: groundedContext)))
-                } else { output.append(APIRequestMessage(role: "user", content: message.content)) }
-            case .assistant: output.append(APIRequestMessage(role: "assistant", content: message.content))
-            case .tool:
-                guard let data = message.content.data(using: .utf8), let event = try? JSONDecoder().decode(ToolHistoryEvent.self, from: data) else {
-                    throw ModelProviderError.invalidToolHistory
-                }
-                let wireName = availableTools.first(where: { $0.name == event.tool && $0.version == event.version })?.wireName
-                    ?? ToolDescriptor.makeWireName(name: event.tool, version: event.version)
-                let arguments = try Self.jsonString(event.arguments)
-                output.append(APIRequestMessage(role: "assistant", content: event.assistantContext?.content, thinking: event.assistantContext?.thinking, toolCalls: [APIToolCall(id: event.providerCallID, type: "function", function: APIFunctionCall(name: wireName, arguments: arguments))]))
-                output.append(APIRequestMessage(role: "tool", content: try event.modelResultContent(), toolCallID: event.providerCallID, toolName: wireName))
-            }
+            output += try historyMessages(message, availableTools: availableTools,
+                groundedContext: message.id == groundedUserID ? groundedContext : nil)
         }
         return output
+    }
+
+    private func systemMessages(hasKnowledge: Bool) -> [APIRequestMessage] {
+        var messages = [APIRequestMessage(role: "system", content: systemPrompt)]
+        if hasKnowledge { messages.append(APIRequestMessage(role: "system", content: Self.groundedContextPolicy)) }
+        return messages
+    }
+
+    private func historyMessages(_ message: ChatMessage, availableTools: [ToolDescriptor], groundedContext: GroundedContext?) throws -> [APIRequestMessage] {
+        switch message.role {
+        case .system, .assistant:
+            return [APIRequestMessage(role: message.role.rawValue, content: message.content)]
+        case .user:
+            let content = groundedContext.map { Self.groundedUserContent(query: message.content, context: $0) } ?? message.content
+            return [APIRequestMessage(role: "user", content: content)]
+        case .tool:
+            guard let data = message.content.data(using: .utf8), let event = try? JSONDecoder().decode(ToolHistoryEvent.self, from: data) else {
+                throw ModelProviderError.invalidToolHistory
+            }
+            let wireName = availableTools.first(where: { $0.name == event.tool && $0.version == event.version })?.wireName
+                ?? ToolDescriptor.makeWireName(name: event.tool, version: event.version)
+            let arguments = try Self.jsonString(event.arguments)
+            return [
+                APIRequestMessage(role: "assistant", content: event.assistantContext?.content, thinking: event.assistantContext?.thinking,
+                    toolCalls: [APIToolCall(id: event.providerCallID, type: "function", function: APIFunctionCall(name: wireName, arguments: arguments))]),
+                APIRequestMessage(role: "tool", content: try event.modelResultContent(), toolCallID: event.providerCallID, toolName: wireName)
+            ]
+        }
+    }
+
+    /// Estimate serialized message/tool fields, including native tool-history
+    /// expansion and provider-specific fields. This is NOT an exact tokenizer or
+    /// a measurement of the server's chat template; the safety reserve still applies.
+    func contextCosts<WireMessage: Encodable>(
+        for request: ModelRequest, estimator: any TokenEstimating, messageOverhead: Int,
+        transform: (APIRequestMessage) throws -> WireMessage
+    ) throws -> ModelContextCosts {
+        let encoder = JSONEncoder()
+        func cost(_ messages: [APIRequestMessage]) throws -> Int {
+            try messages.reduce(0) { total, message in
+                let text = String(decoding: try encoder.encode(transform(message)), as: UTF8.self)
+                return total + estimator.estimateTokens(in: text) + messageOverhead
+            }
+        }
+        var fixed = try cost(systemMessages(hasKnowledge: request.groundedContext != nil))
+        if !request.availableTools.isEmpty {
+            let tools = try encoder.encode(request.availableTools.map(Self.makeToolDefinition))
+            fixed += estimator.estimateTokens(in: String(decoding: tools, as: UTF8.self))
+        }
+        var costs: [Int] = []
+        var knowledge = 0
+        let groundedUserID = request.messages.last(where: { $0.role == .user })?.id
+        for message in request.messages {
+            let plain = try cost(historyMessages(message, availableTools: request.availableTools, groundedContext: nil))
+            costs.append(plain)
+            if message.id == groundedUserID, let context = request.groundedContext {
+                let grounded = try cost(historyMessages(message, availableTools: request.availableTools, groundedContext: context))
+                knowledge = max(0, grounded - plain)
+            }
+        }
+        return ModelContextCosts(messageTokens: costs, fixedTokens: fixed, knowledgeTokens: knowledge)
     }
 
     private static func groundedUserContent(query: String, context: GroundedContext) -> String {

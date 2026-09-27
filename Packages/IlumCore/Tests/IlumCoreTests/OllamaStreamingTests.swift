@@ -15,7 +15,7 @@ final class OllamaStreamingTests: XCTestCase {
         let transport = ScriptedStreamTransport([source.utf8.map { Data([$0]) }])
         let recorder = ProgressRecorder()
         let turn = try await OllamaChatProvider(model: "qwen3:4b", transport: transport).respond(
-            to: ModelRequest(messages: [ChatMessage(role: .user, content: "hello")], maxOutputTokens: 256),
+            to: ModelRequest(messages: [ChatMessage(role: .user, content: "hello")], maxOutputTokens: 256, contextWindow: 4096),
             onProgress: { await recorder.record($0) }
         )
         guard case .final(let answer) = turn else { return XCTFail("Expected final") }
@@ -28,6 +28,7 @@ final class OllamaStreamingTests: XCTestCase {
         XCTAssertEqual(payload["stream"] as? Bool, true)
         XCTAssertEqual(payload["think"] as? Bool, false)
         XCTAssertEqual((payload["options"] as? [String: Any])?["num_predict"] as? Int, 256)
+        XCTAssertEqual((payload["options"] as? [String: Any])?["num_ctx"] as? Int, 4096)
         XCTAssertEqual(transport.cancellations(), 1)
     }
 

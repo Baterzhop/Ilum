@@ -135,7 +135,13 @@ Exact vector scanning is intentionally correctness-first. An ANN/HNSW implementa
 
 `ContextBudgetManager` reserves output and safety space, accounts for grounded evidence, and packs the newest usable history into the remaining model window. The reserved output amount is forwarded as native Ollama `options.num_predict` or OpenAI-compatible `max_tokens`. A provider-reported length truncation is an explicit error before final-answer persistence or tool-call execution.
 
-The current estimator uses a fixed system allowance and packs individual messages. Accounting for the complete serialized prompt/tool schemas and preserving whole user/tool turns during history compaction remain follow-up work. An oversized selected context fails explicitly.
+Native Ollama requests also send `options.num_ctx` from the same context policy used by the runtime. Custom OpenAI-compatible servers must be configured separately to provide at least that context size; there is no universal context-size request field for them.
+
+The built-in providers estimate their serialized system instructions, grounding policy, tool schemas, evidence wrappers and complete assistant/tool history, including native Ollama thinking fields. The configured system allowance is a minimum reserve. These are heuristic estimates, not tokenizer-exact counts or proof of a particular server chat template; the safety reserve remains required. Custom providers without cost information retain the legacy estimate.
+
+History packing retains explicit system messages and the newest complete user turn with all tool results. Older turns are added whole, newest first. An oversized active turn or fixed instructions fail explicitly before the network call. Omitted history is shown in the UI and remains stored; automatic summaries are not implemented here.
+
+SQLite synchronization preserves unchanged message rows, prepares statements once, and writes only changed/new/deleted rows within the existing save/resolution transaction. Snapshot reads/comparison and context estimation remain O(history), so this is not yet constant-time append storage or paginated loading.
 
 ## Citations
 
